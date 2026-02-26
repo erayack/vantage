@@ -93,10 +93,10 @@ impl DropReason {
 #[allow(clippy::pub_underscore_fields)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DropEvent {
-    pub tenant_key: TenantKey,
     pub ts_ns: u64,
+    pub tenant_key: TenantKey,
     pub reason: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 #[cfg(feature = "user")]

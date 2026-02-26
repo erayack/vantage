@@ -5,7 +5,7 @@ use aya::{
     maps::{Array, HashMap},
 };
 use thiserror::Error;
-use vantage_common::{Counters, GlobalStats, LockedCounters, LockedGlobalStats, Policy, TenantKey};
+use vantage_common::{Counters, GlobalStats, Policy, TenantKey};
 
 const GLOBAL_STATS_INDEX: u32 = 0;
 
@@ -123,12 +123,12 @@ impl MapOps for EbpfMapOps {
             let map = ebpf
                 .map_mut("COUNTERS_MAP")
                 .ok_or(MapError::MissingMap("COUNTERS_MAP"))?;
-            let counters_map = HashMap::<_, TenantKey, LockedCounters>::try_from(map)?;
+            let counters_map = HashMap::<_, TenantKey, Counters>::try_from(map)?;
 
             let mut counters = Vec::new();
             for pair in &counters_map {
-                let (tenant, locked) = pair?;
-                counters.push((tenant, locked.counters));
+                let (tenant, value) = pair?;
+                counters.push((tenant, value));
             }
             counters
         };
@@ -147,9 +147,8 @@ impl MapOps for EbpfMapOps {
             let map = ebpf
                 .map_mut("GLOBAL_STATS_MAP")
                 .ok_or(MapError::MissingMap("GLOBAL_STATS_MAP"))?;
-            let global_stats_map = Array::<_, LockedGlobalStats>::try_from(map)?;
-            let locked = global_stats_map.get(&GLOBAL_STATS_INDEX, 0)?;
-            locked.stats
+            let global_stats_map = Array::<_, GlobalStats>::try_from(map)?;
+            global_stats_map.get(&GLOBAL_STATS_INDEX, 0)?
         };
         drop(ebpf);
 

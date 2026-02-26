@@ -2,8 +2,8 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{BPF_F_NO_PREALLOC, TC_ACT_OK, TC_ACT_SHOT, bpf_spin_lock as BpfSpinLock},
-    helpers::{bpf_ktime_get_ns, generated},
+    bindings::{BPF_F_NO_PREALLOC, TC_ACT_OK, TC_ACT_SHOT},
+    helpers::bpf_ktime_get_ns,
     macros::{classifier, map},
     maps::{Array, HashMap, RingBuf},
     programs::TcContext,
@@ -26,48 +26,24 @@ const IPV4_SRC_ADDR_OFFSET: usize = ETHERNET_HEADER_LEN + 12;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const NO_PREALLOC_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
-#[repr(C)]
-struct LockedTokenState {
-    lock: BpfSpinLock,
-    state: TokenState,
-}
-
-#[repr(C)]
-struct LockedCounters {
-    lock: BpfSpinLock,
-    counters: Counters,
-}
-
-#[repr(C)]
-struct LockedGlobalStats {
-    lock: BpfSpinLock,
-    stats: GlobalStats,
-}
-
 #[map]
 static POLICY_MAP: HashMap<TenantKey, Policy> =
     HashMap::<TenantKey, Policy>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
 
 #[map]
 #[allow(dead_code)]
-static STATE_MAP: HashMap<TenantKey, LockedTokenState> =
-    HashMap::<TenantKey, LockedTokenState>::with_max_entries(
-        HASH_MAP_MAX_ENTRIES,
-        NO_PREALLOC_MAP_FLAGS,
-    );
+static STATE_MAP: HashMap<TenantKey, TokenState> =
+    HashMap::<TenantKey, TokenState>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
 
 #[map]
 #[allow(dead_code)]
-static COUNTERS_MAP: HashMap<TenantKey, LockedCounters> =
-    HashMap::<TenantKey, LockedCounters>::with_max_entries(
-        HASH_MAP_MAX_ENTRIES,
-        NO_PREALLOC_MAP_FLAGS,
-    );
+static COUNTERS_MAP: HashMap<TenantKey, Counters> =
+    HashMap::<TenantKey, Counters>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
 
 #[map]
 #[allow(dead_code)]
-static GLOBAL_STATS_MAP: Array<LockedGlobalStats> =
-    Array::<LockedGlobalStats>::with_max_entries(GLOBAL_STATS_MAX_ENTRIES, 0);
+static GLOBAL_STATS_MAP: Array<GlobalStats> =
+    Array::<GlobalStats>::with_max_entries(GLOBAL_STATS_MAX_ENTRIES, 0);
 
 #[map]
 #[allow(dead_code)]
@@ -204,21 +180,12 @@ fn decide_and_store_state(key: TenantKey, now_ns: u64, policy: &Policy) -> Resul
         // SAFETY: Pointer originates from BPF map lookup for `key` and is used
         // only within this function invocation.
         let state = unsafe { &mut *state_ptr };
-        // SAFETY: The lock lives in a BPF map value and guards only its owning
-        // value's critical section.
-        unsafe { generated::bpf_spin_lock(&mut state.lock) };
-        let passed = apply_token_bucket(now_ns, policy, &mut state.state);
-        // SAFETY: Matches lock acquisition above in the same critical section.
-        unsafe { generated::bpf_spin_unlock(&mut state.lock) };
+        let passed = apply_token_bucket(now_ns, policy, state);
         return Ok(passed);
     }
 
     let mut state = initial_state(policy, now_ns);
     let passed = apply_token_bucket(now_ns, policy, &mut state);
-    let state = LockedTokenState {
-        lock: BpfSpinLock { val: 0 },
-        state,
-    };
     STATE_MAP.insert(&key, &state, 0).map_err(|_| ())?;
     Ok(passed)
 }
@@ -258,19 +225,14 @@ fn update_counters(key: TenantKey, pkt_len: u64, passed: bool) -> u64 {
         // SAFETY: Pointer originates from BPF map lookup for `key` and is used
         // only within this function invocation.
         let counters = unsafe { &mut *counters_ptr };
-        // SAFETY: The lock lives in a BPF map value and guards only its owning
-        // value's critical section.
-        unsafe { generated::bpf_spin_lock(&mut counters.lock) };
         if passed {
-            counters.counters.pass_pkts = counters.counters.pass_pkts.saturating_add(1);
-            counters.counters.pass_bytes = counters.counters.pass_bytes.saturating_add(pkt_len);
+            counters.pass_pkts = counters.pass_pkts.saturating_add(1);
+            counters.pass_bytes = counters.pass_bytes.saturating_add(pkt_len);
         } else {
-            counters.counters.drop_pkts = counters.counters.drop_pkts.saturating_add(1);
-            counters.counters.drop_bytes = counters.counters.drop_bytes.saturating_add(pkt_len);
+            counters.drop_pkts = counters.drop_pkts.saturating_add(1);
+            counters.drop_bytes = counters.drop_bytes.saturating_add(pkt_len);
         }
-        let drop_pkts = counters.counters.drop_pkts;
-        // SAFETY: Matches lock acquisition above in the same critical section.
-        unsafe { generated::bpf_spin_unlock(&mut counters.lock) };
+        let drop_pkts = counters.drop_pkts;
         return drop_pkts;
     }
 
@@ -287,12 +249,8 @@ fn update_counters(key: TenantKey, pkt_len: u64, passed: bool) -> u64 {
         counters.drop_pkts = 1;
         counters.drop_bytes = pkt_len;
     }
-    let counters = LockedCounters {
-        lock: BpfSpinLock { val: 0 },
-        counters,
-    };
     let _ = COUNTERS_MAP.insert(&key, &counters, 0);
-    counters.counters.drop_pkts
+    counters.drop_pkts
 }
 
 fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_pkts: u64) {
@@ -301,10 +259,10 @@ fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_p
     }
 
     let event = DropEvent {
-        tenant_key: key,
         ts_ns: now_ns,
+        tenant_key: key,
         reason: reason.as_u8(),
-        _pad: [0; 7],
+        _pad: [0; 3],
     };
 
     let _ = DROP_EVENTS.output::<DropEvent>(event, 0);
@@ -316,33 +274,27 @@ fn update_global_stats(pkt_len: u64, passed: bool, reason: Option<DropReason>) {
         // SAFETY: Pointer originates from BPF array lookup and is used only
         // within this function invocation.
         let stats = unsafe { &mut *stats_ptr };
-        // SAFETY: The lock lives in a BPF map value and guards only its owning
-        // value's critical section.
-        unsafe { generated::bpf_spin_lock(&mut stats.lock) };
         if passed {
-            stats.stats.pass_pkts = stats.stats.pass_pkts.saturating_add(1);
-            stats.stats.pass_bytes = stats.stats.pass_bytes.saturating_add(pkt_len);
+            stats.pass_pkts = stats.pass_pkts.saturating_add(1);
+            stats.pass_bytes = stats.pass_bytes.saturating_add(pkt_len);
         } else {
-            stats.stats.drop_pkts = stats.stats.drop_pkts.saturating_add(1);
-            stats.stats.drop_bytes = stats.stats.drop_bytes.saturating_add(pkt_len);
+            stats.drop_pkts = stats.drop_pkts.saturating_add(1);
+            stats.drop_bytes = stats.drop_bytes.saturating_add(pkt_len);
         }
         if let Some(reason) = reason {
             match reason {
                 DropReason::NoTokens => {
-                    stats.stats.reasons.no_tokens = stats.stats.reasons.no_tokens.saturating_add(1);
+                    stats.reasons.no_tokens = stats.reasons.no_tokens.saturating_add(1);
                 }
                 DropReason::NoPolicy => {
-                    stats.stats.reasons.no_policy = stats.stats.reasons.no_policy.saturating_add(1);
+                    stats.reasons.no_policy = stats.reasons.no_policy.saturating_add(1);
                 }
                 DropReason::ParseFail => {
-                    stats.stats.reasons.parse_fail =
-                        stats.stats.reasons.parse_fail.saturating_add(1);
+                    stats.reasons.parse_fail = stats.reasons.parse_fail.saturating_add(1);
                 }
                 DropReason::StateStoreFail => {}
             }
         }
-        // SAFETY: Matches lock acquisition above in the same critical section.
-        unsafe { generated::bpf_spin_unlock(&mut stats.lock) };
     }
 }
 

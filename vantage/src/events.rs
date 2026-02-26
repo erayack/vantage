@@ -13,9 +13,9 @@ use tracing::{info, warn};
 use vantage_common::{DropEvent, DropReason, TenantKey};
 
 const DROP_EVENTS_MAP: &str = "DROP_EVENTS";
-const TENANT_KEY_OFFSET: usize = 0;
-const TS_NS_OFFSET: usize = 8;
-const REASON_OFFSET: usize = 16;
+const TS_NS_OFFSET: usize = 0;
+const TENANT_KEY_OFFSET: usize = 8;
+const REASON_OFFSET: usize = 12;
 const MAX_EVENTS_PER_WAKE: usize = 1024;
 
 pub(crate) type RingBufferHandle = RingBuf<MapData>;
