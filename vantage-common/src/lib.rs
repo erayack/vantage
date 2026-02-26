@@ -31,6 +31,15 @@ pub struct Counters {
     pub drop_bytes: u64,
 }
 
+#[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockedCounters {
+    pub lock: u32,
+    pub _pad: u32,
+    pub counters: Counters,
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
@@ -68,6 +77,10 @@ unsafe impl Pod for TokenState {}
 #[cfg(feature = "user")]
 // SAFETY: `Counters` is `repr(C)` and contains only plain integer fields.
 unsafe impl Pod for Counters {}
+
+#[cfg(feature = "user")]
+// SAFETY: `LockedCounters` is `repr(C)` and contains only plain integer fields.
+unsafe impl Pod for LockedCounters {}
 
 #[cfg(feature = "user")]
 // SAFETY: `DropEvent` is `repr(C)` and contains only plain integer fields.

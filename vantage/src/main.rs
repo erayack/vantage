@@ -1,67 +1,55 @@
-use std::{net::SocketAddr, sync::Arc};
+pub mod config;
+pub mod control_api;
+pub mod events;
+pub mod map_client;
+pub mod metrics;
+
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderValue, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
 };
 use aya::{
     Ebpf,
     programs::{SchedClassifier, TcAttachType, tc},
+    util::KernelVersion,
 };
-use clap::{Parser, ValueEnum};
-use prometheus::{Encoder, IntGauge, Registry, TextEncoder};
+use prometheus::{IntGauge, Registry};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{signal, sync::Mutex};
+use tokio::signal;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum AttachDirection {
-    Ingress,
-    Egress,
-    Both,
-}
+use crate::{
+    config::Config,
+    control_api::{delete_policy, metrics, put_policy},
+    events::{spawn_drop_event_consumer, take_drop_event_ring},
+    map_client::MapClient,
+};
 
-#[derive(Debug, Parser)]
-struct Opt {
-    #[clap(short, long, default_value = "lo")]
-    iface: String,
-    #[clap(long, value_enum, default_value_t = AttachDirection::Ingress)]
-    direction: AttachDirection,
-    #[clap(long, default_value = "127.0.0.1:3000")]
-    bind_addr: SocketAddr,
-    #[clap(long)]
-    enable_event_stream: bool,
-}
-
-#[derive(Debug, Clone)]
-struct DaemonConfig {
-    iface: String,
-    direction: AttachDirection,
-    bind_addr: SocketAddr,
-    enable_event_stream: bool,
+#[derive(Clone)]
+pub(crate) struct MetricsState {
+    pub(crate) registry: Registry,
+    pub(crate) daemon_up: IntGauge,
 }
 
 #[derive(Clone)]
-struct MetricsState {
-    registry: Registry,
-    daemon_up: IntGauge,
+pub struct AppState {
+    pub(crate) config: Config,
+    pub(crate) drop_events: DropEventRuntime,
+    pub(crate) maps: MapClient,
+    pub(crate) metrics: MetricsState,
 }
 
-#[derive(Clone)]
-struct MapHandles {
-    ebpf: Arc<Mutex<Ebpf>>,
-}
-
-#[derive(Clone)]
-struct AppState {
-    config: DaemonConfig,
-    maps: MapHandles,
-    metrics: MetricsState,
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct DropEventRuntime {
+    pub(crate) sample_n: u32,
+    pub(crate) log_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,12 +57,13 @@ struct HealthResponse {
     status: &'static str,
     iface: String,
     direction: &'static str,
+    drop_events: DropEventRuntime,
 }
 
 #[derive(Debug, Error)]
-enum AppError {
-    #[error("failed to encode Prometheus metrics: {0}")]
-    MetricsEncode(prometheus::Error),
+pub enum AppError {
+    #[error(transparent)]
+    Runtime(#[from] anyhow::Error),
 }
 
 impl IntoResponse for AppError {
@@ -87,38 +76,44 @@ impl IntoResponse for AppError {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    let config = Config::from_args();
+    run(config).await.map_err(anyhow::Error::new)?;
+    Ok(())
+}
 
-    let opt = Opt::parse();
+pub(crate) async fn run(config: Config) -> Result<(), AppError> {
+    setup_memlock_compatibility();
+
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/vantage"
     )))
     .context("failed to load embedded eBPF object")?;
 
-    if opt.enable_event_stream {
-        spawn_ebpf_log_task(&mut ebpf)?;
+    attach_tc(&mut ebpf, &config)?;
+
+    if config.drop_event_log_enabled {
+        let ring_buf =
+            take_drop_event_ring(&mut ebpf).context("failed to acquire DROP_EVENTS map")?;
+        spawn_drop_event_consumer(ring_buf, config.drop_event_sample_n)
+            .context("failed to start drop-event consumer task")?;
     }
 
-    let config = DaemonConfig {
-        iface: opt.iface,
-        direction: opt.direction,
-        bind_addr: opt.bind_addr,
-        enable_event_stream: opt.enable_event_stream,
-    };
-
-    attach_tc(&mut ebpf, &config).context("failed to attach tc program")?;
-
     let metrics_state = build_metrics_state()?;
+    let drop_events = DropEventRuntime {
+        sample_n: config.drop_event_sample_n,
+        log_enabled: config.drop_event_log_enabled,
+    };
     let state = AppState {
         config: config.clone(),
-        maps: MapHandles {
-            ebpf: Arc::new(Mutex::new(ebpf)),
-        },
+        drop_events,
+        maps: MapClient::new(Arc::new(std::sync::Mutex::new(ebpf))),
         metrics: metrics_state,
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/policy/:tenant", put(put_policy).delete(delete_policy))
         .route("/metrics", get(metrics))
         .with_state(state.clone());
 
@@ -128,8 +123,9 @@ async fn main() -> anyhow::Result<()> {
     info!(
         bind_addr = %config.bind_addr,
         iface = %config.iface,
-        direction = %direction_name(config.direction),
-        event_stream = config.enable_event_stream,
+        direction = %direction_name(&config),
+        drop_event_log_enabled = config.drop_event_log_enabled,
+        drop_event_sample_n = config.drop_event_sample_n,
         "vantage daemon started"
     );
 
@@ -141,6 +137,24 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn setup_memlock_compatibility() {
+    match KernelVersion::current() {
+        Ok(current) if current < KernelVersion::new(5, 11, 0) => {
+            info!(
+                kernel_version = %current,
+                "kernel may require RLIMIT_MEMLOCK adjustment; Aya will auto-retry with raised memlock on EPERM"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to detect kernel version for memlock compatibility path"
+            );
+        }
+    }
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -149,7 +163,7 @@ fn init_tracing() {
         .init();
 }
 
-fn attach_tc(ebpf: &mut Ebpf, config: &DaemonConfig) -> anyhow::Result<()> {
+fn attach_tc(ebpf: &mut Ebpf, config: &Config) -> anyhow::Result<()> {
     if let Err(error) = tc::qdisc_add_clsact(&config.iface) {
         warn!(%error, iface = %config.iface, "unable to add clsact qdisc; continuing");
     }
@@ -162,25 +176,20 @@ fn attach_tc(ebpf: &mut Ebpf, config: &DaemonConfig) -> anyhow::Result<()> {
 
     program.load().context("failed to load tc classifier")?;
 
-    match config.direction {
-        AttachDirection::Ingress => {
-            program
-                .attach(&config.iface, TcAttachType::Ingress)
-                .with_context(|| format!("failed to attach tc ingress on {}", config.iface))?;
-        }
-        AttachDirection::Egress => {
-            program
-                .attach(&config.iface, TcAttachType::Egress)
-                .with_context(|| format!("failed to attach tc egress on {}", config.iface))?;
-        }
-        AttachDirection::Both => {
-            program
-                .attach(&config.iface, TcAttachType::Ingress)
-                .with_context(|| format!("failed to attach tc ingress on {}", config.iface))?;
-            program
-                .attach(&config.iface, TcAttachType::Egress)
-                .with_context(|| format!("failed to attach tc egress on {}", config.iface))?;
-        }
+    if !config.attach_ingress && !config.attach_egress {
+        anyhow::bail!("at least one tc attach direction must be enabled");
+    }
+
+    if config.attach_ingress {
+        program
+            .attach(&config.iface, TcAttachType::Ingress)
+            .with_context(|| format!("failed to attach tc ingress on {}", config.iface))?;
+    }
+
+    if config.attach_egress {
+        program
+            .attach(&config.iface, TcAttachType::Egress)
+            .with_context(|| format!("failed to attach tc egress on {}", config.iface))?;
     }
 
     Ok(())
@@ -198,62 +207,22 @@ fn build_metrics_state() -> anyhow::Result<MetricsState> {
     })
 }
 
-fn spawn_ebpf_log_task(ebpf: &mut Ebpf) -> anyhow::Result<()> {
-    match aya_log::EbpfLogger::init(ebpf) {
-        Err(error) => {
-            warn!(%error, "failed to initialize eBPF logger");
-        }
-        Ok(logger) => {
-            let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    if let Ok(mut guard) = logger.readable_mut().await {
-                        guard.get_inner_mut().flush();
-                        guard.clear_ready();
-                    }
-                }
-            });
-        }
-    }
-
-    Ok(())
-}
-
-const fn direction_name(direction: AttachDirection) -> &'static str {
-    match direction {
-        AttachDirection::Ingress => "ingress",
-        AttachDirection::Egress => "egress",
-        AttachDirection::Both => "both",
+const fn direction_name(config: &Config) -> &'static str {
+    match (config.attach_ingress, config.attach_egress) {
+        (true, true) => "both",
+        (true, false) => "ingress",
+        (false, true) => "egress",
+        (false, false) => "none",
     }
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
-    // Keep the eBPF object reachable from shared state to preserve map/program handles.
-    let _ebpf_handle = Arc::clone(&state.maps.ebpf);
-
     Json(HealthResponse {
         status: "ok",
-        iface: state.config.iface,
-        direction: direction_name(state.config.direction),
+        iface: state.config.iface.clone(),
+        direction: direction_name(&state.config),
+        drop_events: state.drop_events,
     })
-}
-
-async fn metrics(State(state): State<AppState>) -> Result<Response, AppError> {
-    state.metrics.daemon_up.set(1);
-    let metric_families = state.metrics.registry.gather();
-
-    let mut payload = Vec::new();
-    TextEncoder::new()
-        .encode(&metric_families, &mut payload)
-        .map_err(AppError::MetricsEncode)?;
-
-    let mut response = payload.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-    );
-    Ok(response)
 }
 
 async fn shutdown_signal() {

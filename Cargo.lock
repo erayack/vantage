@@ -158,17 +158,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aya-log"
-version = "0.2.2"
-source = "git+https://github.com/aya-rs/aya#c42157f0b566940b849b699109d1c660a0733fd3"
-dependencies = [
- "aya",
- "aya-log-common",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "aya-log-common"
 version = "0.1.16"
 source = "git+https://github.com/aya-rs/aya#c42157f0b566940b849b699109d1c660a0733fd3"
@@ -882,6 +871,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,15 +1025,16 @@ dependencies = [
  "axum",
  "aya",
  "aya-build",
- "aya-log",
  "cargo_metadata",
  "clap",
  "libc",
  "prometheus",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "vantage-common",

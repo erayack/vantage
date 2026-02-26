@@ -39,8 +39,7 @@ vantage-common = { path = "../vantage-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 axum = { workspace = true }
 aya = { workspace = true }
-aya-log = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 libc = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
@@ -77,3 +76,7 @@ vantage-ebpf = { path = "../vantage-ebpf" }
 [[bin]]
 name = "vantage"
 path = "src/main.rs"
+
+[dev-dependencies]
+temp-env = "0.3.6"
+tower = { version = "0.5.2", default-features = false, features = ["util"] }
