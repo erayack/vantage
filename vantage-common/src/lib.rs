@@ -3,7 +3,13 @@
 #[cfg(feature = "user")]
 use aya::Pod;
 
+/// `PoC` identity key currently derived from packet `src_ip` (`u32`).
+/// Keep userspace conversion seams in place so this can be migrated to
+/// `cgroup_id` (`u64`) later with minimal API breakage.
 pub type TenantKey = u32;
+
+/// Kernel drop-event emission sampling ratio (`1/N`) used in eBPF.
+pub const KERNEL_DROP_EVENT_SAMPLE_EVERY: u64 = 64;
 
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]

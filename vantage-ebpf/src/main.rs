@@ -8,7 +8,9 @@ use aya_ebpf::{
     maps::{HashMap, RingBuf},
     programs::TcContext,
 };
-use vantage_common::{Counters, DropEvent, DropReason, Policy, TenantKey, TokenState};
+use vantage_common::{
+    Counters, DropEvent, DropReason, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey, TokenState,
+};
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
 const DROP_EVENTS_BYTES: u32 = 1 << 17;
@@ -19,7 +21,6 @@ const IPV4_VERSION: u8 = 4;
 const IPV4_VERSION_IHL_OFFSET: usize = ETHERNET_HEADER_LEN;
 const IPV4_SRC_ADDR_OFFSET: usize = ETHERNET_HEADER_LEN + 12;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
-const DROP_EVENT_SAMPLE_EVERY: u64 = 64;
 const NO_PREALLOC_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[repr(C)]
@@ -268,7 +269,7 @@ fn update_counters(key: TenantKey, pkt_len: u64, passed: bool) -> u64 {
 }
 
 fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_pkts: u64) {
-    if drop_pkts == 0 || (drop_pkts & (DROP_EVENT_SAMPLE_EVERY - 1)) != 0 {
+    if drop_pkts == 0 || (drop_pkts & (KERNEL_DROP_EVENT_SAMPLE_EVERY - 1)) != 0 {
         return;
     }
 
@@ -297,6 +298,8 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
+
     use super::*;
 
     fn policy(rate_tokens_per_sec: u64, burst_tokens: u64) -> Policy {
@@ -345,5 +348,11 @@ mod tests {
         let passed = apply_token_bucket(NANOS_PER_SEC, &policy, &mut state);
 
         assert!(!passed);
+    }
+
+    #[test]
+    fn kernel_drop_event_sampling_constant_is_fixed() {
+        assert_eq!(KERNEL_DROP_EVENT_SAMPLE_EVERY, 64);
+        assert!(KERNEL_DROP_EVENT_SAMPLE_EVERY.is_power_of_two());
     }
 }

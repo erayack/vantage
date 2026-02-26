@@ -5,7 +5,10 @@ use aya::{
     maps::{MapData, RingBuf},
 };
 use thiserror::Error;
-use tokio::io::{Interest, unix::AsyncFd};
+use tokio::{
+    io::{Interest, unix::AsyncFd},
+    sync::watch,
+};
 use tracing::{info, warn};
 use vantage_common::{DropEvent, DropReason, TenantKey};
 
@@ -13,6 +16,9 @@ const DROP_EVENTS_MAP: &str = "DROP_EVENTS";
 const TENANT_KEY_OFFSET: usize = 0;
 const TS_NS_OFFSET: usize = 8;
 const REASON_OFFSET: usize = 16;
+const MAX_EVENTS_PER_WAKE: usize = 1024;
+
+pub(crate) type RingBufferHandle = RingBuf<MapData>;
 
 #[derive(Debug, Error)]
 pub(crate) enum EventError {
@@ -29,7 +35,7 @@ pub(crate) enum EventError {
 /// # Errors
 ///
 /// Returns `EventError` when the map is missing or cannot be converted to a typed ring buffer.
-pub(crate) fn take_drop_event_ring(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>, EventError> {
+pub(crate) fn take_drop_event_ring(ebpf: &mut Ebpf) -> Result<RingBufferHandle, EventError> {
     let map = ebpf
         .take_map(DROP_EVENTS_MAP)
         .ok_or(EventError::MissingMap(DROP_EVENTS_MAP))?;
@@ -37,50 +43,88 @@ pub(crate) fn take_drop_event_ring(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>, 
     Ok(ring_buf)
 }
 
-/// Spawns a background task that consumes and logs sampled drop events.
+/// Runs a ring buffer consumer until shutdown is requested.
 ///
 /// # Errors
 ///
 /// Returns `EventError` when preparing async readiness polling fails.
-pub(crate) fn spawn_drop_event_consumer(
-    ring_buf: RingBuf<MapData>,
-    sample_n: u32,
+pub(crate) async fn run_drop_event_consumer(
+    ring: RingBufferHandle,
+    mut shutdown: watch::Receiver<bool>,
+    log_sample_n: u32,
 ) -> Result<(), EventError> {
-    let sample_n = sample_n.max(1);
-    let mut async_fd = AsyncFd::with_interest(ring_buf, Interest::READABLE)?;
+    let log_sample_n = log_sample_n.max(1);
+    let mut async_fd = AsyncFd::with_interest(ring, Interest::READABLE)?;
+    let mut seen_events = 0_u64;
 
-    tokio::task::spawn(async move {
-        let mut seen_events = 0_u64;
-        loop {
-            let mut guard = match async_fd.readable_mut().await {
-                Ok(guard) => guard,
-                Err(error) => {
-                    warn!(%error, "failed while waiting on drop-event ring buffer readiness");
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if should_stop_after_shutdown_change(changed.is_err(), *shutdown.borrow()) {
                     break;
                 }
-            };
-
-            let ring_buf = guard.get_inner_mut();
-            while let Some(item) = ring_buf.next() {
-                if let Some(event) = decode_drop_event(&item) {
-                    seen_events = seen_events.saturating_add(1);
-                    if seen_events.is_multiple_of(u64::from(sample_n)) {
-                        info!(
-                            tenant = event.tenant,
-                            reason = event.reason,
-                            ts_ns = event.ts_ns,
-                            "drop event"
-                        );
-                    }
-                } else {
-                    warn!(len = item.len(), "received malformed drop event payload");
-                }
             }
-            guard.clear_ready();
+            readiness = async_fd.readable_mut() => {
+                let mut guard = match readiness {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        warn!(%error, "failed while waiting on drop-event ring buffer readiness");
+                        break;
+                    }
+                };
+
+                let ring_buf = guard.get_inner_mut();
+                let mut processed = 0_usize;
+                let mut skipped = 0_usize;
+                while let Some(item) = ring_buf.next() {
+                    if processed < MAX_EVENTS_PER_WAKE {
+                        if let Some(event) = decode_drop_event(&item) {
+                            seen_events = seen_events.saturating_add(1);
+                            if seen_events.is_multiple_of(u64::from(log_sample_n)) {
+                                info!(
+                                    tenant = event.tenant,
+                                    reason = event.reason,
+                                    ts_ns = event.ts_ns,
+                                    log_sample_n,
+                                    "drop event"
+                                );
+                            }
+                        } else {
+                            warn!(len = item.len(), "received malformed drop event payload");
+                        }
+                    } else {
+                        skipped = skipped.saturating_add(1);
+                    }
+
+                    processed = processed.saturating_add(1);
+                }
+
+                if skipped > 0 {
+                    warn!(skipped, "drop-event consumer skipped buffered events due to backpressure");
+                }
+                guard.clear_ready();
+            }
         }
-    });
+    }
 
     Ok(())
+}
+
+/// Spawns a background task that consumes and logs sampled drop events.
+pub(crate) fn spawn_drop_event_consumer(
+    ring_buf: RingBufferHandle,
+    shutdown: watch::Receiver<bool>,
+    log_sample_n: u32,
+) {
+    tokio::task::spawn(async move {
+        if let Err(error) = run_drop_event_consumer(ring_buf, shutdown, log_sample_n).await {
+            warn!(%error, "drop-event consumer stopped with error");
+        }
+    });
+}
+
+const fn should_stop_after_shutdown_change(channel_closed: bool, shutdown_requested: bool) -> bool {
+    channel_closed || shutdown_requested
 }
 
 struct DecodedDropEvent {
@@ -120,5 +164,39 @@ const fn reason_name(reason: u8) -> &'static str {
         "state_store_fail"
     } else {
         "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+
+    use super::should_stop_after_shutdown_change;
+
+    #[tokio::test]
+    async fn shutdown_channel_stays_open_while_sender_is_retained() {
+        let (tx, mut rx) = watch::channel(false);
+
+        let timed = tokio::time::timeout(Duration::from_millis(10), rx.changed()).await;
+        assert!(
+            timed.is_err(),
+            "receiver should remain pending while sender is retained without updates"
+        );
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn shutdown_channel_reports_closed_when_sender_is_dropped() {
+        let (tx, mut rx) = watch::channel(false);
+        drop(tx);
+
+        let changed = rx.changed().await;
+        assert!(
+            should_stop_after_shutdown_change(changed.is_err(), *rx.borrow()),
+            "closed shutdown channel should stop the consumer loop"
+        );
     }
 }

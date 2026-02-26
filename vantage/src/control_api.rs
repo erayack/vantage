@@ -11,7 +11,8 @@ use vantage_common::Policy;
 use crate::{
     AppState,
     map_client::MapError,
-    metrics::{MetricsError, render_metrics},
+    metrics::{MetricsError, render_metrics_payload},
+    tenant::{TenantParseError, TenantRef},
 };
 
 #[derive(Debug, Deserialize)]
@@ -26,12 +27,26 @@ pub(crate) enum ApiError {
     #[error("map operation failed: {0}")]
     Map(#[from] MapError),
     #[error(transparent)]
+    Tenant(#[from] TenantParseError),
+    #[error(transparent)]
     Metrics(#[from] MetricsError),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
+        match self {
+            Self::Tenant(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            Self::Map(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("map operation failed: {error}"),
+            )
+                .into_response(),
+            Self::Metrics(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("metrics operation failed: {error}"),
+            )
+                .into_response(),
+        }
     }
 }
 
@@ -41,10 +56,11 @@ impl IntoResponse for ApiError {
 ///
 /// Returns `ApiError` when map lookup/update fails.
 pub(crate) async fn put_policy(
-    Path(tenant): Path<u32>,
+    Path(tenant): Path<String>,
     State(app): State<AppState>,
     Json(req): Json<PutPolicyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let tenant = TenantRef::parse(&tenant)?.to_tenant_key();
     let maps = app.maps;
     let policy = Policy {
         rate_tokens_per_sec: req.rate_tokens_per_sec,
@@ -63,9 +79,10 @@ pub(crate) async fn put_policy(
 ///
 /// Returns `ApiError` when map lookup/delete fails.
 pub(crate) async fn delete_policy(
-    Path(tenant): Path<u32>,
+    Path(tenant): Path<String>,
     State(app): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
+    let tenant = TenantRef::parse(&tenant)?.to_tenant_key();
     let maps = app.maps;
     maps.delete_policy(tenant)?;
 
@@ -78,7 +95,7 @@ pub(crate) async fn delete_policy(
 ///
 /// Returns `ApiError` when metric encoding or map iteration fails.
 pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let payload = render_metrics(&state.metrics, &state.maps)?;
+    let payload = render_metrics_payload(&state.metrics, &state.maps)?;
 
     let mut response = payload.into_response();
     response.headers_mut().insert(
@@ -104,7 +121,7 @@ mod tests {
     };
     use prometheus::{IntGauge, Registry};
     use tower::util::ServiceExt as _;
-    use vantage_common::{Counters, Policy, TenantKey};
+    use vantage_common::{Counters, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey};
 
     use super::{delete_policy, put_policy};
     use crate::{
@@ -163,11 +180,12 @@ mod tests {
                 bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
                 attach_ingress: true,
                 attach_egress: false,
-                drop_event_sample_n: 1,
+                drop_event_log_sample_n: 1,
                 drop_event_log_enabled: false,
             },
             drop_events: DropEventRuntime {
-                sample_n: 1,
+                kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
+                log_sample_n: 1,
                 log_enabled: false,
             },
             maps,
@@ -204,6 +222,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_policy_accepts_canonical_ip_tenant() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn put_policy_accepts_bare_ipv4_tenant() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn put_policy_accepts_legacy_u32_tenant() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/167838211")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_invalid_tenant() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/not-a-tenant")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn delete_policy_is_idempotent() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
@@ -235,5 +353,27 @@ mod tests {
             Err(error) => match error {},
         };
         assert_eq!(second_resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_policy_rejects_invalid_tenant() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/policy/not-a-tenant")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

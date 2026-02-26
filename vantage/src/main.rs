@@ -3,6 +3,7 @@ pub mod control_api;
 pub mod events;
 pub mod map_client;
 pub mod metrics;
+pub mod tenant;
 
 use std::sync::Arc;
 
@@ -22,8 +23,9 @@ use aya::{
 use prometheus::{IntGauge, Registry};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::signal;
+use tokio::{signal, sync::watch};
 use tracing::{info, warn};
+use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
 
 use crate::{
     config::Config,
@@ -48,7 +50,8 @@ pub struct AppState {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) struct DropEventRuntime {
-    pub(crate) sample_n: u32,
+    pub(crate) kernel_sample_every: u64,
+    pub(crate) log_sample_n: u32,
     pub(crate) log_enabled: bool,
 }
 
@@ -83,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
 
 pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     setup_memlock_compatibility();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -95,13 +99,17 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     if config.drop_event_log_enabled {
         let ring_buf =
             take_drop_event_ring(&mut ebpf).context("failed to acquire DROP_EVENTS map")?;
-        spawn_drop_event_consumer(ring_buf, config.drop_event_sample_n)
-            .context("failed to start drop-event consumer task")?;
+        spawn_drop_event_consumer(
+            ring_buf,
+            shutdown_rx.clone(),
+            config.drop_event_log_sample_n,
+        );
     }
 
     let metrics_state = build_metrics_state()?;
     let drop_events = DropEventRuntime {
-        sample_n: config.drop_event_sample_n,
+        kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
+        log_sample_n: config.drop_event_log_sample_n,
         log_enabled: config.drop_event_log_enabled,
     };
     let state = AppState {
@@ -125,12 +133,13 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         iface = %config.iface,
         direction = %direction_name(&config),
         drop_event_log_enabled = config.drop_event_log_enabled,
-        drop_event_sample_n = config.drop_event_sample_n,
+        drop_event_log_sample_n = config.drop_event_log_sample_n,
+        kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
         "vantage daemon started"
     );
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await
         .context("HTTP server exited with error")?;
 
@@ -225,11 +234,109 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
     if let Err(error) = signal::ctrl_c().await {
         warn!(%error, "failed to listen for shutdown signal");
         return;
     }
 
+    if let Err(error) = shutdown_tx.send(true) {
+        warn!(%error, "failed to notify drop-event consumer shutdown");
+    }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use prometheus::{IntGauge, Registry};
+    use vantage_common::{Counters, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey};
+
+    use super::{AppState, DropEventRuntime, MetricsState, direction_name, healthz};
+    use crate::{
+        config::Config,
+        map_client::{MapClient, MapError, MapOps},
+    };
+
+    struct NoopMapOps;
+
+    impl MapOps for NoopMapOps {
+        fn upsert_policy(&self, _tenant: TenantKey, _policy: Policy) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn delete_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_state(config: Config, drop_events: DropEventRuntime) -> AppState {
+        let registry = Registry::new();
+        let metric = IntGauge::new("vantage_daemon_up", "Daemon running state");
+        let Ok(daemon_up) = metric else {
+            panic!("metric should initialize");
+        };
+        daemon_up.set(1);
+        let register = registry.register(Box::new(daemon_up.clone()));
+        assert!(register.is_ok(), "metric registration should succeed");
+
+        AppState {
+            config,
+            drop_events,
+            maps: MapClient::from_ops(Arc::new(NoopMapOps)),
+            metrics: MetricsState {
+                registry,
+                daemon_up,
+            },
+        }
+    }
+
+    #[test]
+    fn direction_name_reports_both() {
+        let config = Config {
+            iface: "lo".to_owned(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+            attach_ingress: true,
+            attach_egress: true,
+            drop_event_log_sample_n: 5,
+            drop_event_log_enabled: true,
+        };
+        assert_eq!(direction_name(&config), "both");
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_kernel_and_log_sampling() {
+        let config = Config {
+            iface: "lo".to_owned(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+            attach_ingress: true,
+            attach_egress: false,
+            drop_event_log_sample_n: 5,
+            drop_event_log_enabled: true,
+        };
+        let state = test_state(
+            config,
+            DropEventRuntime {
+                kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
+                log_sample_n: 5,
+                log_enabled: true,
+            },
+        );
+
+        let response = healthz(State(state)).await;
+        let json = response.0;
+        assert_eq!(json.direction, "ingress");
+        assert_eq!(
+            json.drop_events.kernel_sample_every,
+            KERNEL_DROP_EVENT_SAMPLE_EVERY
+        );
+        assert_eq!(json.drop_events.log_sample_n, 5);
+        assert!(json.drop_events.log_enabled);
+    }
 }

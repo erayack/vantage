@@ -23,8 +23,13 @@ struct Cli {
     direction: AttachDirection,
     #[arg(long, default_value = "127.0.0.1:3000", env = "VANTAGE_BIND_ADDR")]
     bind_addr: SocketAddr,
-    #[arg(long, default_value_t = 1, env = "VANTAGE_DROP_EVENT_SAMPLE_N")]
-    drop_event_sample_n: u32,
+    #[arg(
+        long = "drop-event-sample-n",
+        alias = "drop-event-log-sample-n",
+        default_value_t = 1,
+        env = "VANTAGE_DROP_EVENT_SAMPLE_N"
+    )]
+    drop_event_log_sample_n: u32,
     #[arg(
         long = "drop-event-log-enabled",
         alias = "enable-event-stream",
@@ -39,7 +44,7 @@ pub(crate) struct Config {
     pub(crate) bind_addr: SocketAddr,
     pub(crate) attach_ingress: bool,
     pub(crate) attach_egress: bool,
-    pub(crate) drop_event_sample_n: u32,
+    pub(crate) drop_event_log_sample_n: u32,
     pub(crate) drop_event_log_enabled: bool,
 }
 
@@ -71,7 +76,7 @@ impl Config {
             bind_addr: cli.bind_addr,
             attach_ingress,
             attach_egress,
-            drop_event_sample_n: cli.drop_event_sample_n.max(1),
+            drop_event_log_sample_n: cli.drop_event_log_sample_n.max(1),
             drop_event_log_enabled: cli.drop_event_log_enabled,
         }
     }
@@ -94,12 +99,22 @@ mod tests {
     }
 
     #[test]
+    fn default_direction_is_ingress_only() {
+        let parsed = Config::try_from_iter(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert!(config.attach_ingress);
+        assert!(!config.attach_egress);
+    }
+
+    #[test]
     fn drop_event_sample_is_clamped_to_one() {
         let parsed = Config::try_from_iter(["vantage", "--drop-event-sample-n", "0"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
-        assert_eq!(config.drop_event_sample_n, 1);
+        assert_eq!(config.drop_event_log_sample_n, 1);
     }
 
     #[test]

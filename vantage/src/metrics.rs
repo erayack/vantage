@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use prometheus::{Encoder, TextEncoder};
 use thiserror::Error;
 use vantage_common::{Counters, TenantKey};
@@ -15,12 +17,22 @@ pub(crate) enum MetricsError {
     Encode(#[from] prometheus::Error),
 }
 
+/// Builds Prometheus text output from tenant counters in `COUNTERS_MAP`.
+///
+/// # Errors
+///
+/// Returns `MetricsError` when map reads fail.
+pub(crate) fn render_metrics(maps: &MapClient) -> Result<String, MetricsError> {
+    let counters = maps.collect_counters()?;
+    Ok(append_counter_metrics(&counters))
+}
+
 /// Builds Prometheus text output from daemon and tenant counters.
 ///
 /// # Errors
 ///
 /// Returns `MetricsError` when map reads or metric encoding fail.
-pub(crate) fn render_metrics(
+pub(crate) fn render_metrics_payload(
     metrics: &MetricsState,
     maps: &MapClient,
 ) -> Result<Vec<u8>, MetricsError> {
@@ -30,58 +42,47 @@ pub(crate) fn render_metrics(
     let mut payload = Vec::new();
     TextEncoder::new().encode(&metric_families, &mut payload)?;
 
-    let counters = maps.collect_counters()?;
-    append_counter_metrics(&mut payload, &counters);
+    let counters = render_metrics(maps)?;
+    payload.extend_from_slice(counters.as_bytes());
 
     Ok(payload)
 }
 
-fn append_counter_metrics(payload: &mut Vec<u8>, counters: &[(TenantKey, Counters)]) {
-    payload.extend_from_slice(
-        b"# HELP vantage_tenant_pass_packets Total packets allowed for tenant.\n",
-    );
-    payload.extend_from_slice(b"# TYPE vantage_tenant_pass_packets counter\n");
-    payload.extend_from_slice(
-        b"# HELP vantage_tenant_drop_packets Total packets dropped for tenant.\n",
-    );
-    payload.extend_from_slice(b"# TYPE vantage_tenant_drop_packets counter\n");
-    payload
-        .extend_from_slice(b"# HELP vantage_tenant_pass_bytes Total bytes allowed for tenant.\n");
-    payload.extend_from_slice(b"# TYPE vantage_tenant_pass_bytes counter\n");
-    payload
-        .extend_from_slice(b"# HELP vantage_tenant_drop_bytes Total bytes dropped for tenant.\n");
-    payload.extend_from_slice(b"# TYPE vantage_tenant_drop_bytes counter\n");
+fn append_counter_metrics(counters: &[(TenantKey, Counters)]) -> String {
+    let mut payload = String::new();
+    payload.push_str("# HELP vantage_tenant_pass_packets Total packets allowed for tenant.\n");
+    payload.push_str("# TYPE vantage_tenant_pass_packets counter\n");
+    payload.push_str("# HELP vantage_tenant_drop_packets Total packets dropped for tenant.\n");
+    payload.push_str("# TYPE vantage_tenant_drop_packets counter\n");
+    payload.push_str("# HELP vantage_tenant_pass_bytes Total bytes allowed for tenant.\n");
+    payload.push_str("# TYPE vantage_tenant_pass_bytes counter\n");
+    payload.push_str("# HELP vantage_tenant_drop_bytes Total bytes dropped for tenant.\n");
+    payload.push_str("# TYPE vantage_tenant_drop_bytes counter\n");
 
     for (tenant, counters) in counters {
-        payload.extend_from_slice(
-            format!(
-                "vantage_tenant_pass_packets{{tenant=\"{tenant}\"}} {}\n",
-                counters.pass_pkts
-            )
-            .as_bytes(),
+        let _ = writeln!(
+            payload,
+            "vantage_tenant_pass_packets{{tenant=\"{tenant}\"}} {}",
+            counters.pass_pkts
         );
-        payload.extend_from_slice(
-            format!(
-                "vantage_tenant_drop_packets{{tenant=\"{tenant}\"}} {}\n",
-                counters.drop_pkts
-            )
-            .as_bytes(),
+        let _ = writeln!(
+            payload,
+            "vantage_tenant_drop_packets{{tenant=\"{tenant}\"}} {}",
+            counters.drop_pkts
         );
-        payload.extend_from_slice(
-            format!(
-                "vantage_tenant_pass_bytes{{tenant=\"{tenant}\"}} {}\n",
-                counters.pass_bytes
-            )
-            .as_bytes(),
+        let _ = writeln!(
+            payload,
+            "vantage_tenant_pass_bytes{{tenant=\"{tenant}\"}} {}",
+            counters.pass_bytes
         );
-        payload.extend_from_slice(
-            format!(
-                "vantage_tenant_drop_bytes{{tenant=\"{tenant}\"}} {}\n",
-                counters.drop_bytes
-            )
-            .as_bytes(),
+        let _ = writeln!(
+            payload,
+            "vantage_tenant_drop_bytes{{tenant=\"{tenant}\"}} {}",
+            counters.drop_bytes
         );
     }
+
+    payload
 }
 
 #[cfg(test)]
@@ -90,21 +91,17 @@ mod tests {
 
     #[test]
     fn tenant_metrics_use_real_newlines() {
-        let mut payload = Vec::new();
-        append_counter_metrics(
-            &mut payload,
-            &[(
-                42,
-                Counters {
-                    pass_pkts: 1,
-                    drop_pkts: 2,
-                    pass_bytes: 3,
-                    drop_bytes: 4,
-                },
-            )],
-        );
+        let payload = append_counter_metrics(&[(
+            42,
+            Counters {
+                pass_pkts: 1,
+                drop_pkts: 2,
+                pass_bytes: 3,
+                drop_bytes: 4,
+            },
+        )]);
 
-        let text = String::from_utf8_lossy(&payload);
+        let text = payload;
         assert!(text.contains("vantage_tenant_pass_packets{tenant=\"42\"} 1\n"));
         assert!(text.contains("vantage_tenant_drop_packets{tenant=\"42\"} 2\n"));
         assert!(text.contains("vantage_tenant_pass_bytes{tenant=\"42\"} 3\n"));
