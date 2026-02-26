@@ -36,6 +36,8 @@ struct Cli {
         env = "VANTAGE_DROP_EVENT_LOG_ENABLED"
     )]
     drop_event_log_enabled: bool,
+    #[arg(long, default_value_t = 5_000_u64, env = "VANTAGE_CPU_WINDOW_MS")]
+    cpu_window_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ pub(crate) struct Config {
     pub(crate) attach_egress: bool,
     pub(crate) drop_event_log_sample_n: u32,
     pub(crate) drop_event_log_enabled: bool,
+    pub(crate) cpu_window_ms: u64,
 }
 
 impl Config {
@@ -78,6 +81,7 @@ impl Config {
             attach_egress,
             drop_event_log_sample_n: cli.drop_event_log_sample_n.max(1),
             drop_event_log_enabled: cli.drop_event_log_enabled,
+            cpu_window_ms: cli.cpu_window_ms.max(1),
         }
     }
 }
@@ -127,5 +131,23 @@ mod tests {
             assert!(config.attach_ingress);
             assert!(!config.attach_egress);
         });
+    }
+
+    #[test]
+    fn cpu_window_ms_uses_default() {
+        let parsed = Config::try_from_iter(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.cpu_window_ms, 5_000);
+    }
+
+    #[test]
+    fn cpu_window_ms_is_clamped_to_one() {
+        let parsed = Config::try_from_iter(["vantage", "--cpu-window-ms", "0"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.cpu_window_ms, 1);
     }
 }

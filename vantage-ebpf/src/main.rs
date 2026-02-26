@@ -5,14 +5,17 @@ use aya_ebpf::{
     bindings::{BPF_F_NO_PREALLOC, TC_ACT_OK, TC_ACT_SHOT, bpf_spin_lock as BpfSpinLock},
     helpers::{bpf_ktime_get_ns, generated},
     macros::{classifier, map},
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::TcContext,
 };
 use vantage_common::{
-    Counters, DropEvent, DropReason, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey, TokenState,
+    Counters, DropEvent, DropReason, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy,
+    TenantKey, TokenState,
 };
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
+const GLOBAL_STATS_MAX_ENTRIES: u32 = 1;
+const GLOBAL_STATS_INDEX: u32 = 0;
 const DROP_EVENTS_BYTES: u32 = 1 << 17;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHER_TYPE_OFFSET: usize = 12;
@@ -33,6 +36,12 @@ struct LockedTokenState {
 struct LockedCounters {
     lock: BpfSpinLock,
     counters: Counters,
+}
+
+#[repr(C)]
+struct LockedGlobalStats {
+    lock: BpfSpinLock,
+    stats: GlobalStats,
 }
 
 #[map]
@@ -57,6 +66,11 @@ static COUNTERS_MAP: HashMap<TenantKey, LockedCounters> =
 
 #[map]
 #[allow(dead_code)]
+static GLOBAL_STATS_MAP: Array<LockedGlobalStats> =
+    Array::<LockedGlobalStats>::with_max_entries(GLOBAL_STATS_MAX_ENTRIES, 0);
+
+#[map]
+#[allow(dead_code)]
 static DROP_EVENTS: RingBuf = RingBuf::with_byte_size(DROP_EVENTS_BYTES, 0);
 
 #[classifier]
@@ -73,16 +87,19 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
 
     let Some(tenant_key) = tenant_key_from_packet(ctx) else {
         // Fail-open on parse failure.
+        update_global_stats(pkt_len, true, Some(DropReason::ParseFail));
         return Ok(TC_ACT_OK);
     };
 
     let Some(policy) = read_policy(tenant_key) else {
         update_counters(tenant_key, pkt_len, true);
+        update_global_stats(pkt_len, true, Some(DropReason::NoPolicy));
         return Ok(TC_ACT_OK);
     };
 
     if policy.enabled == 0 {
         update_counters(tenant_key, pkt_len, true);
+        update_global_stats(pkt_len, true, None);
         return Ok(TC_ACT_OK);
     }
 
@@ -90,11 +107,21 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
         Ok(passed) => passed,
         Err(()) => {
             let drop_pkts = update_counters(tenant_key, pkt_len, false);
+            update_global_stats(pkt_len, false, None);
             maybe_emit_drop_event(tenant_key, now_ns, DropReason::StateStoreFail, drop_pkts);
             return Ok(TC_ACT_SHOT);
         }
     };
     let drop_pkts = update_counters(tenant_key, pkt_len, passed);
+    update_global_stats(
+        pkt_len,
+        passed,
+        if passed {
+            None
+        } else {
+            Some(DropReason::NoTokens)
+        },
+    );
     if passed {
         Ok(TC_ACT_OK)
     } else {
@@ -281,6 +308,42 @@ fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_p
     };
 
     let _ = DROP_EVENTS.output::<DropEvent>(event, 0);
+}
+
+#[allow(unsafe_code)]
+fn update_global_stats(pkt_len: u64, passed: bool, reason: Option<DropReason>) {
+    if let Some(stats_ptr) = GLOBAL_STATS_MAP.get_ptr_mut(GLOBAL_STATS_INDEX) {
+        // SAFETY: Pointer originates from BPF array lookup and is used only
+        // within this function invocation.
+        let stats = unsafe { &mut *stats_ptr };
+        // SAFETY: The lock lives in a BPF map value and guards only its owning
+        // value's critical section.
+        unsafe { generated::bpf_spin_lock(&mut stats.lock) };
+        if passed {
+            stats.stats.pass_pkts = stats.stats.pass_pkts.saturating_add(1);
+            stats.stats.pass_bytes = stats.stats.pass_bytes.saturating_add(pkt_len);
+        } else {
+            stats.stats.drop_pkts = stats.stats.drop_pkts.saturating_add(1);
+            stats.stats.drop_bytes = stats.stats.drop_bytes.saturating_add(pkt_len);
+        }
+        if let Some(reason) = reason {
+            match reason {
+                DropReason::NoTokens => {
+                    stats.stats.reasons.no_tokens = stats.stats.reasons.no_tokens.saturating_add(1);
+                }
+                DropReason::NoPolicy => {
+                    stats.stats.reasons.no_policy = stats.stats.reasons.no_policy.saturating_add(1);
+                }
+                DropReason::ParseFail => {
+                    stats.stats.reasons.parse_fail =
+                        stats.stats.reasons.parse_fail.saturating_add(1);
+                }
+                DropReason::StateStoreFail => {}
+            }
+        }
+        // SAFETY: Matches lock acquisition above in the same critical section.
+        unsafe { generated::bpf_spin_unlock(&mut stats.lock) };
+    }
 }
 
 #[allow(unsafe_code)]

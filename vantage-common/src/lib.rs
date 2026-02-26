@@ -38,12 +38,39 @@ pub struct Counters {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReasonBuckets {
+    pub no_tokens: u64,
+    pub no_policy: u64,
+    pub parse_fail: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlobalStats {
+    pub pass_pkts: u64,
+    pub drop_pkts: u64,
+    pub pass_bytes: u64,
+    pub drop_bytes: u64,
+    pub reasons: ReasonBuckets,
+}
+
+#[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockedCounters {
     pub lock: u32,
     pub _pad: u32,
     pub counters: Counters,
+}
+
+#[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockedGlobalStats {
+    pub lock: u32,
+    pub _pad: u32,
+    pub stats: GlobalStats,
 }
 
 #[repr(u8)]
@@ -85,8 +112,20 @@ unsafe impl Pod for TokenState {}
 unsafe impl Pod for Counters {}
 
 #[cfg(feature = "user")]
+// SAFETY: `ReasonBuckets` is `repr(C)` and contains only plain integer fields.
+unsafe impl Pod for ReasonBuckets {}
+
+#[cfg(feature = "user")]
+// SAFETY: `GlobalStats` is `repr(C)` and contains only plain integer fields.
+unsafe impl Pod for GlobalStats {}
+
+#[cfg(feature = "user")]
 // SAFETY: `LockedCounters` is `repr(C)` and contains only plain integer fields.
 unsafe impl Pod for LockedCounters {}
+
+#[cfg(feature = "user")]
+// SAFETY: `LockedGlobalStats` is `repr(C)` and contains only plain integer fields.
+unsafe impl Pod for LockedGlobalStats {}
 
 #[cfg(feature = "user")]
 // SAFETY: `DropEvent` is `repr(C)` and contains only plain integer fields.

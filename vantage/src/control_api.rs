@@ -6,12 +6,12 @@ use axum::{
 };
 use serde::Deserialize;
 use thiserror::Error;
-use vantage_common::Policy;
+use vantage_common::{GlobalStats, Policy, ReasonBuckets, TenantKey};
 
 use crate::{
     AppState,
     map_client::MapError,
-    metrics::{MetricsError, render_metrics_payload},
+    metrics::{CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async},
     tenant::{TenantParseError, TenantRef},
 };
 
@@ -20,6 +20,61 @@ pub(crate) struct PutPolicyRequest {
     pub rate_tokens_per_sec: u64,
     pub burst_tokens: u64,
     pub enabled: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct BenchmarkSnapshot {
+    pub ts_unix_ms: u64,
+    pub cpu: CpuWindowSample,
+    pub global: GlobalStatsView,
+    pub top_tenants: Option<Vec<TenantCounterView>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct GlobalStatsView {
+    pub pass_pkts: u64,
+    pub drop_pkts: u64,
+    pub pass_bytes: u64,
+    pub drop_bytes: u64,
+    pub reasons: ReasonBucketsView,
+}
+
+impl From<GlobalStats> for GlobalStatsView {
+    fn from(stats: GlobalStats) -> Self {
+        Self {
+            pass_pkts: stats.pass_pkts,
+            drop_pkts: stats.drop_pkts,
+            pass_bytes: stats.pass_bytes,
+            drop_bytes: stats.drop_bytes,
+            reasons: stats.reasons.into(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ReasonBucketsView {
+    pub no_tokens: u64,
+    pub no_policy: u64,
+    pub parse_fail: u64,
+}
+
+impl From<ReasonBuckets> for ReasonBucketsView {
+    fn from(reasons: ReasonBuckets) -> Self {
+        Self {
+            no_tokens: reasons.no_tokens,
+            no_policy: reasons.no_policy,
+            parse_fail: reasons.parse_fail,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TenantCounterView {
+    pub tenant: TenantKey,
+    pub pass_pkts: u64,
+    pub drop_pkts: u64,
+    pub pass_bytes: u64,
+    pub drop_bytes: u64,
 }
 
 #[derive(Debug, Error)]
@@ -106,6 +161,45 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     Ok(response)
 }
 
+/// Samples daemon and host CPU over the configured window and returns averaged utilization.
+///
+/// # Errors
+///
+/// Returns `ApiError` when CPU sampling fails.
+pub(crate) async fn debug_cpu_window(
+    State(state): State<AppState>,
+) -> Result<Json<CpuWindowSample>, ApiError> {
+    let sample_window = std::time::Duration::from_millis(state.config.cpu_window_ms);
+    let sample = sample_cpu_window_async(sample_window).await?;
+
+    Ok(Json(sample))
+}
+
+/// Builds a benchmark-friendly snapshot with timestamp, CPU window, and global counters.
+///
+/// # Errors
+///
+/// Returns `ApiError` when CPU sampling or map reads fail.
+pub(crate) async fn debug_snapshot(
+    State(app): State<AppState>,
+) -> Result<Json<BenchmarkSnapshot>, ApiError> {
+    let sample_window = std::time::Duration::from_millis(app.config.cpu_window_ms);
+    let cpu = sample_cpu_window_async(sample_window).await?;
+    let global = app.maps.read_global_stats()?;
+    let ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+
+    Ok(Json(BenchmarkSnapshot {
+        ts_unix_ms,
+        cpu,
+        global: global.into(),
+        top_tenants: None,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -115,15 +209,17 @@ mod tests {
 
     use axum::{
         Router,
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
-        routing::put,
+        routing::{get, put},
     };
     use prometheus::{IntGauge, Registry};
     use tower::util::ServiceExt as _;
-    use vantage_common::{Counters, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey};
+    use vantage_common::{
+        Counters, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets, TenantKey,
+    };
 
-    use super::{delete_policy, put_policy};
+    use super::{debug_cpu_window, debug_snapshot, delete_policy, put_policy};
     use crate::{
         AppState, DropEventRuntime, MetricsState,
         config::Config,
@@ -132,12 +228,35 @@ mod tests {
 
     struct InMemoryMapOps {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
+        global_stats: GlobalStats,
     }
 
     impl InMemoryMapOps {
         const fn new() -> Self {
             Self {
                 policies: Mutex::new(BTreeMap::new()),
+                global_stats: Self::default_global_stats(),
+            }
+        }
+
+        const fn with_global_stats(global_stats: GlobalStats) -> Self {
+            Self {
+                policies: Mutex::new(BTreeMap::new()),
+                global_stats,
+            }
+        }
+
+        const fn default_global_stats() -> GlobalStats {
+            GlobalStats {
+                pass_pkts: 0,
+                drop_pkts: 0,
+                pass_bytes: 0,
+                drop_bytes: 0,
+                reasons: ReasonBuckets {
+                    no_tokens: 0,
+                    no_policy: 0,
+                    parse_fail: 0,
+                },
             }
         }
     }
@@ -162,6 +281,10 @@ mod tests {
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
             Ok(Vec::new())
         }
+
+        fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
+            Ok(self.global_stats)
+        }
     }
 
     fn test_state(maps: MapClient) -> AppState {
@@ -182,6 +305,7 @@ mod tests {
                 attach_egress: false,
                 drop_event_log_sample_n: 1,
                 drop_event_log_enabled: false,
+                cpu_window_ms: 5_000,
             },
             drop_events: DropEventRuntime {
                 kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
@@ -375,5 +499,111 @@ mod tests {
             Err(error) => match error {},
         };
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn debug_cpu_window_returns_json_sample_from_fixture_state() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let mut state = test_state(maps);
+        state.config.cpu_window_ms = 1;
+        let app = Router::new()
+            .route("/debug/cpu-window", get(debug_cpu_window))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/debug/cpu-window")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let response = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let read = to_bytes(response.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+
+        let window_ms = payload["window_ms"].as_u64();
+        assert!(window_ms.is_some_and(|value| value >= 1));
+        let system = payload["system_cpu_percent"].as_f64();
+        let daemon = payload["daemon_cpu_percent"].as_f64();
+        assert!(system.is_some(), "system cpu percent should be present");
+        assert!(daemon.is_some(), "daemon cpu percent should be present");
+    }
+
+    #[tokio::test]
+    async fn debug_snapshot_returns_contract_shape_with_null_top_tenants() {
+        let fixture_stats = GlobalStats {
+            pass_pkts: 11,
+            drop_pkts: 3,
+            pass_bytes: 1_500,
+            drop_bytes: 300,
+            reasons: ReasonBuckets {
+                no_tokens: 2,
+                no_policy: 1,
+                parse_fail: 4,
+            },
+        };
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::with_global_stats(fixture_stats)));
+        let mut state = test_state(maps);
+        state.config.cpu_window_ms = 1;
+        let app = Router::new()
+            .route("/debug/snapshot", get(debug_snapshot))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/debug/snapshot")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let response = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let read = to_bytes(response.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+
+        assert!(payload["ts_unix_ms"].as_u64().is_some());
+        assert!(payload["cpu"]["window_ms"].as_u64().is_some());
+        assert!(payload["cpu"]["system_cpu_percent"].as_f64().is_some());
+        assert!(payload["cpu"]["daemon_cpu_percent"].as_f64().is_some());
+        assert_eq!(payload["global"]["pass_pkts"], serde_json::json!(11));
+        assert_eq!(payload["global"]["drop_pkts"], serde_json::json!(3));
+        assert_eq!(payload["global"]["pass_bytes"], serde_json::json!(1_500));
+        assert_eq!(payload["global"]["drop_bytes"], serde_json::json!(300));
+        assert_eq!(
+            payload["global"]["reasons"]["no_tokens"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            payload["global"]["reasons"]["no_policy"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["global"]["reasons"]["parse_fail"],
+            serde_json::json!(4)
+        );
+        assert!(payload["top_tenants"].is_null());
     }
 }

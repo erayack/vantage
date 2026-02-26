@@ -29,7 +29,7 @@ use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
 
 use crate::{
     config::Config,
-    control_api::{delete_policy, metrics, put_policy},
+    control_api::{debug_cpu_window, debug_snapshot, delete_policy, metrics, put_policy},
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
 };
@@ -60,6 +60,7 @@ struct HealthResponse {
     status: &'static str,
     iface: String,
     direction: &'static str,
+    cpu_window_ms: u64,
     drop_events: DropEventRuntime,
 }
 
@@ -123,6 +124,8 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         .route("/healthz", get(healthz))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
         .route("/metrics", get(metrics))
+        .route("/debug/cpu-window", get(debug_cpu_window))
+        .route("/debug/snapshot", get(debug_snapshot))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
@@ -132,6 +135,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         bind_addr = %config.bind_addr,
         iface = %config.iface,
         direction = %direction_name(&config),
+        cpu_window_ms = config.cpu_window_ms,
         drop_event_log_enabled = config.drop_event_log_enabled,
         drop_event_log_sample_n = config.drop_event_log_sample_n,
         kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
@@ -230,6 +234,7 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         iface: state.config.iface.clone(),
         direction: direction_name(&state.config),
+        cpu_window_ms: state.config.cpu_window_ms,
         drop_events: state.drop_events,
     })
 }
@@ -252,7 +257,9 @@ mod tests {
 
     use axum::extract::State;
     use prometheus::{IntGauge, Registry};
-    use vantage_common::{Counters, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey};
+    use vantage_common::{
+        Counters, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets, TenantKey,
+    };
 
     use super::{AppState, DropEventRuntime, MetricsState, direction_name, healthz};
     use crate::{
@@ -273,6 +280,20 @@ mod tests {
 
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
             Ok(Vec::new())
+        }
+
+        fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
+            Ok(GlobalStats {
+                pass_pkts: 0,
+                drop_pkts: 0,
+                pass_bytes: 0,
+                drop_bytes: 0,
+                reasons: ReasonBuckets {
+                    no_tokens: 0,
+                    no_policy: 0,
+                    parse_fail: 0,
+                },
+            })
         }
     }
 
@@ -306,6 +327,7 @@ mod tests {
             attach_egress: true,
             drop_event_log_sample_n: 5,
             drop_event_log_enabled: true,
+            cpu_window_ms: 5_000,
         };
         assert_eq!(direction_name(&config), "both");
     }
@@ -319,6 +341,7 @@ mod tests {
             attach_egress: false,
             drop_event_log_sample_n: 5,
             drop_event_log_enabled: true,
+            cpu_window_ms: 2_500,
         };
         let state = test_state(
             config,
@@ -336,6 +359,7 @@ mod tests {
             json.drop_events.kernel_sample_every,
             KERNEL_DROP_EVENT_SAMPLE_EVERY
         );
+        assert_eq!(json.cpu_window_ms, 2_500);
         assert_eq!(json.drop_events.log_sample_n, 5);
         assert!(json.drop_events.log_enabled);
     }
