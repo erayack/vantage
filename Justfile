@@ -2,6 +2,6 @@
 check:
     cargo +nightly fmt
     cargo +nightly fmt --check
-    cargo clippy --all-targets -j 1
-    cargo build -j 1
-    cargo test --no-run -j 1
+    cargo clippy --all-targets
+    cargo build
+    cargo test --no-run

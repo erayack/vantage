@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 warnings = "deny"
 future_incompatible = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "deny", priority = -1 }

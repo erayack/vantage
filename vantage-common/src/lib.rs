@@ -37,6 +37,7 @@ pub enum DropReason {
     NoTokens = 1,
     NoPolicy = 2,
     ParseFail = 3,
+    StateStoreFail = 4,
 }
 
 impl DropReason {
