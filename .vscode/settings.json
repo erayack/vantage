@@ -1,0 +1,11 @@
+{
+  "rust-analyzer.check.workspace": false,
+  "rust-analyzer.checkOnSave.enable": false,
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.cargo.features": [],
+  "rust-analyzer.cargo.target": "x86_64-apple-darwin",
+  "rust-analyzer.linkedProjects": [
+    "vantage/Cargo.toml",
+    "vantage-common/Cargo.toml"
+  ]
+}

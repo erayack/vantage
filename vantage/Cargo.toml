@@ -1,0 +1,79 @@
+[package]
+name = "vantage"
+version = "0.1.0"
+edition.workspace = true
+
+license.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+perf = { level = "deny", priority = 9 }
+pedantic = { level = "warn", priority = 3 }
+nursery = { level = "warn", priority = 2 }
+needless_collect = { level = "deny", priority = 11 }
+redundant_clone = { level = "deny", priority = 11 }
+unnecessary_wraps = { level = "deny", priority = 11 }
+unwrap_used = { level = "deny", priority = 8 }
+expect_used = { level = "deny", priority = 8 }
+dbg_macro = { level = "deny", priority = 8 }
+todo = { level = "warn", priority = 8 }
+unimplemented = { level = "deny", priority = 8 }
+print_stdout = { level = "deny", priority = 8 }
+print_stderr = { level = "deny", priority = 8 }
+implicit_clone = { level = "deny", priority = 8 }
+mem_forget = { level = "deny", priority = 8 }
+
+[dependencies]
+vantage-common = { path = "../vantage-common", features = ["user"] }
+
+anyhow = { workspace = true, default-features = true }
+axum = { workspace = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+libc = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
+# it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
+# script to build this, but we want to teach cargo about the dependency so that cache invalidation
+# works properly.
+#
+# Note also that https://github.com/rust-lang/cargo/issues/10593 occurs when `target = ...` is added
+# to an artifact dependency; it seems possible to work around that by setting `resolver = "1"` in
+# Cargo.toml in the workspace root.
+#
+# Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
+# workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
+# features.
+vantage-ebpf = { path = "../vantage-ebpf" }
+
+[[bin]]
+name = "vantage"
+path = "src/main.rs"
