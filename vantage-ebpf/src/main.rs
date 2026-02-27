@@ -2,15 +2,17 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{BPF_F_NO_PREALLOC, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::bpf_ktime_get_ns,
+    bindings::{
+        BPF_F_NO_PREALLOC, BPF_NOEXIST, TC_ACT_OK, TC_ACT_SHOT, bpf_spin_lock as AyaBpfSpinLock,
+    },
+    helpers::{bpf_ktime_get_ns, bpf_spin_lock as bpf_helper_spin_lock, bpf_spin_unlock},
     macros::{classifier, map},
     maps::{Array, HashMap, RingBuf},
     programs::TcContext,
 };
 use vantage_common::{
     Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY,
-    Policy, TenantKey, TokenState,
+    LockedTokenState, Policy, TenantKey, TokenState,
 };
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
@@ -38,8 +40,11 @@ static POLICY_MAP: HashMap<TenantKey, Policy> =
 
 #[map]
 #[allow(dead_code)]
-static STATE_MAP: HashMap<TenantKey, TokenState> =
-    HashMap::<TenantKey, TokenState>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
+static STATE_MAP: HashMap<TenantKey, LockedTokenState> =
+    HashMap::<TenantKey, LockedTokenState>::with_max_entries(
+        HASH_MAP_MAX_ENTRIES,
+        NO_PREALLOC_MAP_FLAGS,
+    );
 
 #[map]
 #[allow(dead_code)]
@@ -264,20 +269,52 @@ fn initial_state(policy: &Policy, now_ns: u64) -> TokenState {
     }
 }
 
+fn initial_locked_state(policy: &Policy, now_ns: u64) -> LockedTokenState {
+    LockedTokenState::from_state(initial_state(policy, now_ns))
+}
+
+#[allow(unsafe_code)]
+fn apply_token_bucket_with_lock(
+    now_ns: u64,
+    policy: &Policy,
+    locked_state: &mut LockedTokenState,
+) -> bool {
+    // SAFETY: `locked_state` points to a map value and `lock` is the lock field
+    // within that map value. The lock is always paired with an unlock in this
+    // function before returning.
+    unsafe {
+        bpf_helper_spin_lock(core::ptr::from_mut(&mut locked_state.lock).cast::<AyaBpfSpinLock>())
+    };
+    let passed = apply_token_bucket(now_ns, policy, &mut locked_state.state);
+    // SAFETY: This unlock matches the lock call above and uses the same map
+    // value lock pointer.
+    unsafe {
+        bpf_spin_unlock(core::ptr::from_mut(&mut locked_state.lock).cast::<AyaBpfSpinLock>())
+    };
+    passed
+}
+
 #[allow(unsafe_code)]
 fn decide_and_store_state(key: TenantKey, now_ns: u64, policy: &Policy) -> Result<bool, ()> {
-    if let Some(state_ptr) = STATE_MAP.get_ptr_mut(&key) {
+    if let Some(locked_state_ptr) = STATE_MAP.get_ptr_mut(&key) {
         // SAFETY: Pointer originates from BPF map lookup for `key` and is used
         // only within this function invocation.
-        let state = unsafe { &mut *state_ptr };
-        let passed = apply_token_bucket(now_ns, policy, state);
+        let locked_state = unsafe { &mut *locked_state_ptr };
+        let passed = apply_token_bucket_with_lock(now_ns, policy, locked_state);
         return Ok(passed);
     }
 
-    let mut state = initial_state(policy, now_ns);
-    let passed = apply_token_bucket(now_ns, policy, &mut state);
-    STATE_MAP.insert(&key, &state, 0).map_err(|_| ())?;
-    Ok(passed)
+    let locked_state = initial_locked_state(policy, now_ns);
+    let _ = STATE_MAP.insert(&key, &locked_state, u64::from(BPF_NOEXIST));
+
+    if let Some(locked_state_ptr) = STATE_MAP.get_ptr_mut(&key) {
+        // SAFETY: Pointer originates from BPF map lookup for `key` and is used
+        // only within this function invocation.
+        let locked_state = unsafe { &mut *locked_state_ptr };
+        return Ok(apply_token_bucket_with_lock(now_ns, policy, locked_state));
+    }
+
+    Err(())
 }
 
 fn refill_tokens(now_ns: u64, policy: &Policy, state: &mut TokenState) {
@@ -422,6 +459,8 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier, Mutex};
+
     use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
 
     use super::*;
@@ -551,5 +590,124 @@ mod tests {
         let packet_len = l4_offset;
         let parsed = parse_l4_dst_port(1, packet_len, l4_offset, None);
         assert_eq!(parsed, Some(0));
+    }
+
+    #[derive(Default)]
+    struct FirstTouchState {
+        value: Mutex<Option<TokenState>>,
+    }
+
+    fn old_first_touch_update(
+        state: &FirstTouchState,
+        now_ns: u64,
+        policy: &Policy,
+        read_barrier: &Barrier,
+        insert_barrier: &Barrier,
+    ) -> bool {
+        if let Ok(mut guard) = state.value.lock() {
+            if let Some(existing) = guard.as_mut() {
+                return apply_token_bucket(now_ns, policy, existing);
+            }
+        }
+
+        read_barrier.wait();
+        let mut local = initial_state(policy, now_ns);
+        let passed = apply_token_bucket(now_ns, policy, &mut local);
+        insert_barrier.wait();
+
+        if let Ok(mut guard) = state.value.lock() {
+            *guard = Some(local);
+        }
+        passed
+    }
+
+    fn noexist_first_touch_update(
+        state: &FirstTouchState,
+        now_ns: u64,
+        policy: &Policy,
+        read_barrier: &Barrier,
+        insert_barrier: &Barrier,
+    ) -> bool {
+        if let Ok(mut guard) = state.value.lock() {
+            if let Some(existing) = guard.as_mut() {
+                return apply_token_bucket(now_ns, policy, existing);
+            }
+        }
+
+        read_barrier.wait();
+        let local = initial_state(policy, now_ns);
+        insert_barrier.wait();
+
+        if let Ok(mut guard) = state.value.lock() {
+            if guard.is_none() {
+                *guard = Some(local);
+            }
+        }
+
+        if let Ok(mut guard) = state.value.lock()
+            && let Some(existing) = guard.as_mut()
+        {
+            return apply_token_bucket(now_ns, policy, existing);
+        }
+
+        false
+    }
+
+    #[test]
+    fn first_touch_parallel_updates_require_noexist_insert_semantics() {
+        let policy = policy(0, 1);
+        let now_ns = 123_u64;
+        let old_state = Arc::new(FirstTouchState::default());
+        let new_state = Arc::new(FirstTouchState::default());
+
+        let old_read = Arc::new(Barrier::new(2));
+        let old_insert = Arc::new(Barrier::new(2));
+        let old_a = {
+            let state = Arc::clone(&old_state);
+            let read = Arc::clone(&old_read);
+            let insert = Arc::clone(&old_insert);
+            std::thread::spawn(move || {
+                old_first_touch_update(&state, now_ns, &policy, &read, &insert)
+            })
+        };
+        let old_b = {
+            let state = Arc::clone(&old_state);
+            let read = Arc::clone(&old_read);
+            let insert = Arc::clone(&old_insert);
+            std::thread::spawn(move || {
+                old_first_touch_update(&state, now_ns, &policy, &read, &insert)
+            })
+        };
+        let old_passes =
+            usize::from(old_a.join().unwrap_or(false)) + usize::from(old_b.join().unwrap_or(false));
+        assert_eq!(
+            old_passes, 2,
+            "legacy overwrite path can over-admit on first touch"
+        );
+
+        let new_read = Arc::new(Barrier::new(2));
+        let new_insert = Arc::new(Barrier::new(2));
+        let new_a = {
+            let state = Arc::clone(&new_state);
+            let read = Arc::clone(&new_read);
+            let insert = Arc::clone(&new_insert);
+            std::thread::spawn(move || {
+                noexist_first_touch_update(&state, now_ns, &policy, &read, &insert)
+            })
+        };
+        let new_b = {
+            let state = Arc::clone(&new_state);
+            let read = Arc::clone(&new_read);
+            let insert = Arc::clone(&new_insert);
+            std::thread::spawn(move || {
+                noexist_first_touch_update(&state, now_ns, &policy, &read, &insert)
+            })
+        };
+        let new_passes =
+            usize::from(new_a.join().unwrap_or(false)) + usize::from(new_b.join().unwrap_or(false));
+        assert_eq!(
+            new_passes, 1,
+            "BPF_NOEXIST-style insert prevents first-touch leakage"
+        );
     }
 }

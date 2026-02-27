@@ -1,10 +1,10 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vantage_common::{GlobalStats, Policy, ReasonBuckets, TenantKey};
 
@@ -12,13 +12,31 @@ use crate::{
     AppState,
     map_client::MapError,
     metrics::{CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async},
-    tenant::{TenantParseError, TenantRef},
+    tenant::{FlowProto, TenantParseError, TenantRef},
 };
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PutPolicyRequest {
     pub rate_tokens_per_sec: u64,
     pub burst_tokens: u64,
+    pub enabled: bool,
+    pub proto: Option<String>,
+    pub dst_port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PutEnabledRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct DeletePolicyQuery {
+    pub proto: Option<String>,
+    pub dst_port: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GlobalEnabledResponse {
     pub enabled: bool,
 }
 
@@ -115,7 +133,10 @@ pub(crate) async fn put_policy(
     State(app): State<AppState>,
     Json(req): Json<PutPolicyRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = TenantRef::parse(&tenant)?.to_tenant_key();
+    let proto = parse_proto(req.proto.as_deref())?;
+    let tenant = TenantRef::parse(&tenant)?
+        .with_flow(proto, req.dst_port)?
+        .to_tenant_key();
     let maps = app.maps;
     let policy = Policy {
         rate_tokens_per_sec: req.rate_tokens_per_sec,
@@ -128,6 +149,31 @@ pub(crate) async fn put_policy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Sets global data-path enabled state in `GLOBAL_CONFIG_MAP[0]`.
+///
+/// # Errors
+///
+/// Returns `ApiError` when map write fails.
+pub(crate) async fn put_admin_enabled(
+    State(app): State<AppState>,
+    Json(req): Json<PutEnabledRequest>,
+) -> Result<StatusCode, ApiError> {
+    app.maps.set_global_enabled(req.enabled)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reads global data-path enabled state from `GLOBAL_CONFIG_MAP[0]`.
+///
+/// # Errors
+///
+/// Returns `ApiError` when map read fails.
+pub(crate) async fn get_admin_enabled(
+    State(app): State<AppState>,
+) -> Result<Json<GlobalEnabledResponse>, ApiError> {
+    let enabled = app.maps.get_global_enabled()?;
+    Ok(Json(GlobalEnabledResponse { enabled }))
+}
+
 /// Deletes a tenant policy from `POLICY_MAP`.
 ///
 /// # Errors
@@ -135,9 +181,13 @@ pub(crate) async fn put_policy(
 /// Returns `ApiError` when map lookup/delete fails.
 pub(crate) async fn delete_policy(
     Path(tenant): Path<String>,
+    Query(query): Query<DeletePolicyQuery>,
     State(app): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = TenantRef::parse(&tenant)?.to_tenant_key();
+    let proto = parse_proto(query.proto.as_deref())?;
+    let tenant = TenantRef::parse(&tenant)?
+        .with_flow(proto, query.dst_port)?
+        .to_tenant_key();
     let maps = app.maps;
     maps.delete_policy(tenant)?;
 
@@ -200,6 +250,13 @@ pub(crate) async fn debug_snapshot(
     }))
 }
 
+fn parse_proto(proto: Option<&str>) -> Result<Option<FlowProto>, TenantParseError> {
+    match proto {
+        Some(raw) => Ok(Some(FlowProto::parse(raw)?)),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -219,7 +276,10 @@ mod tests {
         Counters, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets, TenantKey,
     };
 
-    use super::{debug_cpu_window, debug_snapshot, delete_policy, put_policy};
+    use super::{
+        debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled, put_admin_enabled,
+        put_policy,
+    };
     use crate::{
         AppState, DropEventRuntime, MetricsState,
         config::Config,
@@ -443,6 +503,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_policy_accepts_flow_fields() {
+        let fixture = Arc::new(InMemoryMapOps::new());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        match fixture.policies.lock() {
+            Ok(policies) => {
+                let tenant = TenantKey {
+                    src_ip: 167_838_211,
+                    dst_port: 443,
+                    proto: 6,
+                    _pad: 0,
+                };
+                assert!(
+                    policies.contains_key(&tenant),
+                    "flow-specific key should be written"
+                );
+            }
+            Err(error) => {
+                panic!("fixture lock should not be poisoned: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_proto_without_dst_port() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"udp"}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_dst_port_without_proto() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"dst_port":53}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_invalid_proto() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"icmp","dst_port":53}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn put_policy_rejects_invalid_tenant() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
@@ -521,6 +700,120 @@ mod tests {
             Err(error) => match error {},
         };
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_policy_accepts_flow_query_fields() {
+        let fixture = Arc::new(InMemoryMapOps::new());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443}"#,
+            ));
+        let Ok(put_request) = put_req else {
+            panic!("request should build");
+        };
+        let put_response = match app.clone().oneshot(put_request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+        let delete_req = Request::builder()
+            .method("DELETE")
+            .uri("/policy/ip:10.1.2.3?proto=tcp&dst_port=443")
+            .body(Body::empty());
+        let Ok(delete_request) = delete_req else {
+            panic!("request should build");
+        };
+        let delete_response = match app.oneshot(delete_request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        match fixture.policies.lock() {
+            Ok(policies) => assert!(policies.is_empty(), "flow-specific key should be deleted"),
+            Err(error) => panic!("fixture lock should not be poisoned: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_policy_rejects_proto_without_dst_port() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/policy/ip:10.1.2.3?proto=udp")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_admin_enabled_sets_global_flag() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route(
+                "/admin/enabled",
+                put(put_admin_enabled).get(get_admin_enabled),
+            )
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/admin/enabled")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"enabled":false}"#));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let response = match app.clone().oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/admin/enabled")
+            .body(Body::empty());
+        let Ok(get_request) = get_req else {
+            panic!("request should build");
+        };
+        let get_response = match app.oneshot(get_request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let read = to_bytes(get_response.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(payload, serde_json::json!({"enabled": false}));
     }
 
     #[tokio::test]

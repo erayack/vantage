@@ -29,7 +29,10 @@ use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
 
 use crate::{
     config::Config,
-    control_api::{debug_cpu_window, debug_snapshot, delete_policy, metrics, put_policy},
+    control_api::{
+        debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled, metrics,
+        put_admin_enabled, put_policy,
+    },
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
 };
@@ -126,6 +129,10 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+        .route(
+            "/admin/enabled",
+            put(put_admin_enabled).get(get_admin_enabled),
+        )
         .route("/metrics", get(metrics))
         .route("/debug/cpu-window", get(debug_cpu_window))
         .route("/debug/snapshot", get(debug_snapshot))
@@ -259,6 +266,10 @@ mod tests {
     use std::sync::Arc;
 
     use axum::extract::State;
+    use aya::{
+        Ebpf,
+        programs::{SchedClassifier, TcAttachType, tc},
+    };
     use prometheus::{IntGauge, Registry};
     use vantage_common::{
         Counters, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets, TenantKey,
@@ -373,5 +384,33 @@ mod tests {
         assert_eq!(json.cpu_window_ms, 2_500);
         assert_eq!(json.drop_events.log_sample_n, 5);
         assert!(json.drop_events.log_enabled);
+    }
+
+    #[test]
+    #[ignore = "requires root privileges and tc attach support on the host kernel"]
+    fn tc_program_loads_and_attaches_on_loopback() {
+        let object = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/vantage"));
+        let ebpf = Ebpf::load(object);
+        let Ok(mut ebpf) = ebpf else {
+            panic!("embedded eBPF object should load");
+        };
+
+        let _ = tc::qdisc_add_clsact("lo");
+        let program = ebpf.program_mut("vantage_tc");
+        let Some(program) = program else {
+            panic!("vantage_tc program should exist");
+        };
+        let classifier: Result<&mut SchedClassifier, _> = program.try_into();
+        let Ok(classifier) = classifier else {
+            panic!("vantage_tc should be a SchedClassifier");
+        };
+        assert!(
+            classifier.load().is_ok(),
+            "verifier should accept program including spinlock-backed map value"
+        );
+        assert!(
+            classifier.attach("lo", TcAttachType::Ingress).is_ok(),
+            "program should attach on loopback ingress"
+        );
     }
 }

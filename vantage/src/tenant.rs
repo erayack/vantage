@@ -4,8 +4,37 @@ use thiserror::Error;
 use vantage_common::TenantKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TenantRef {
-    SrcIp(u32),
+pub(crate) enum FlowProto {
+    Tcp,
+    Udp,
+}
+
+impl FlowProto {
+    pub(crate) const fn parse(raw: &str) -> Result<Self, TenantParseError> {
+        if raw.eq_ignore_ascii_case("tcp") {
+            return Ok(Self::Tcp);
+        }
+
+        if raw.eq_ignore_ascii_case("udp") {
+            return Ok(Self::Udp);
+        }
+
+        Err(TenantParseError::InvalidProto)
+    }
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Tcp => 6,
+            Self::Udp => 17,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TenantRef {
+    src_ip: u32,
+    proto: Option<FlowProto>,
+    dst_port: Option<u16>,
 }
 
 impl TenantRef {
@@ -18,38 +47,74 @@ impl TenantRef {
             return parse_ipv4(raw);
         }
 
-        let key = raw.parse::<u32>().map_err(|_| TenantParseError::Invalid)?;
-        Ok(Self::SrcIp(key))
+        let src_ip = raw.parse::<u32>().map_err(|_| TenantParseError::Invalid)?;
+        Ok(Self {
+            src_ip,
+            proto: None,
+            dst_port: None,
+        })
+    }
+
+    pub(crate) const fn with_flow(
+        mut self,
+        proto: Option<FlowProto>,
+        dst_port: Option<u16>,
+    ) -> Result<Self, TenantParseError> {
+        if proto.is_some() && dst_port.is_none() {
+            return Err(TenantParseError::MissingDstPort);
+        }
+
+        if proto.is_none() && dst_port.is_some() {
+            return Err(TenantParseError::MissingProto);
+        }
+
+        self.proto = proto;
+        self.dst_port = dst_port;
+        Ok(self)
     }
 
     pub(crate) const fn to_tenant_key(self) -> TenantKey {
-        match self {
-            Self::SrcIp(key) => TenantKey {
-                src_ip: key,
-                dst_port: 0,
-                proto: 0,
-                _pad: 0,
+        TenantKey {
+            src_ip: self.src_ip,
+            dst_port: match self.dst_port {
+                Some(port) => port,
+                None => 0,
             },
+            proto: match self.proto {
+                Some(proto) => proto.to_u8(),
+                None => 0,
+            },
+            _pad: 0,
         }
     }
 }
 
 fn parse_ipv4(raw: &str) -> Result<TenantRef, TenantParseError> {
     let addr = Ipv4Addr::from_str(raw).map_err(|_| TenantParseError::Invalid)?;
-    Ok(TenantRef::SrcIp(u32::from(addr)))
+    Ok(TenantRef {
+        src_ip: u32::from(addr),
+        proto: None,
+        dst_port: None,
+    })
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum TenantParseError {
     #[error("invalid tenant key")]
     Invalid,
+    #[error("invalid proto, expected tcp|udp")]
+    InvalidProto,
+    #[error("dst_port is required when proto is set")]
+    MissingDstPort,
+    #[error("proto is required when dst_port is set")]
+    MissingProto,
 }
 
 #[cfg(test)]
 mod tests {
     use vantage_common::TenantKey;
 
-    use super::TenantRef;
+    use super::{FlowProto, TenantRef};
 
     #[test]
     fn parses_canonical_ip_prefix() {
@@ -57,7 +122,14 @@ mod tests {
         let Ok(tenant) = parsed else {
             panic!("tenant parsing should succeed");
         };
-        assert_eq!(tenant, TenantRef::SrcIp(167_838_211));
+        assert_eq!(
+            tenant,
+            TenantRef {
+                src_ip: 167_838_211,
+                proto: None,
+                dst_port: None,
+            }
+        );
     }
 
     #[test]
@@ -66,7 +138,14 @@ mod tests {
         let Ok(tenant) = parsed else {
             panic!("tenant parsing should succeed");
         };
-        assert_eq!(tenant, TenantRef::SrcIp(167_838_211));
+        assert_eq!(
+            tenant,
+            TenantRef {
+                src_ip: 167_838_211,
+                proto: None,
+                dst_port: None,
+            }
+        );
     }
 
     #[test]
@@ -75,7 +154,14 @@ mod tests {
         let Ok(tenant) = parsed else {
             panic!("tenant parsing should succeed");
         };
-        assert_eq!(tenant, TenantRef::SrcIp(167_838_211));
+        assert_eq!(
+            tenant,
+            TenantRef {
+                src_ip: 167_838_211,
+                proto: None,
+                dst_port: None,
+            }
+        );
     }
 
     #[test]
@@ -86,7 +172,11 @@ mod tests {
 
     #[test]
     fn converts_tenant_ref_to_key() {
-        let tenant = TenantRef::SrcIp(42);
+        let tenant = TenantRef {
+            src_ip: 42,
+            proto: None,
+            dst_port: None,
+        };
         assert_eq!(
             tenant.to_tenant_key(),
             TenantKey {
@@ -96,5 +186,47 @@ mod tests {
                 _pad: 0
             }
         );
+    }
+
+    #[test]
+    fn converts_flow_aware_tenant_ref_to_key() {
+        let base = TenantRef::parse("ip:10.1.2.3");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let tenant = base.with_flow(Some(FlowProto::Tcp), Some(443));
+        let Ok(tenant) = tenant else {
+            panic!("flow override should succeed");
+        };
+
+        assert_eq!(
+            tenant.to_tenant_key(),
+            TenantKey {
+                src_ip: 167_838_211,
+                dst_port: 443,
+                proto: 6,
+                _pad: 0
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_proto_without_dst_port() {
+        let base = TenantRef::parse("42");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let err = base.with_flow(Some(FlowProto::Udp), None);
+
+        assert!(err.is_err(), "proto-only flow should be rejected");
+    }
+
+    #[test]
+    fn parses_proto_case_insensitively() {
+        let parsed = FlowProto::parse("TCP");
+        let Ok(proto) = parsed else {
+            panic!("proto parsing should succeed");
+        };
+        assert_eq!(proto, FlowProto::Tcp);
     }
 }

@@ -39,10 +39,29 @@ pub struct TokenState {
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct bpf_spin_lock {
+    pub val: u32,
+}
+
+#[repr(C)]
+#[allow(clippy::pub_underscore_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockedTokenState {
-    pub lock: u32,
+    pub lock: bpf_spin_lock,
     pub _pad: u32,
     pub state: TokenState,
+}
+
+impl LockedTokenState {
+    #[must_use]
+    pub const fn from_state(state: TokenState) -> Self {
+        Self {
+            lock: bpf_spin_lock { val: 0 },
+            _pad: 0,
+            state,
+        }
+    }
 }
 
 #[repr(C)]
@@ -135,6 +154,10 @@ unsafe impl Pod for Policy {}
 #[cfg(feature = "user")]
 // SAFETY: `TokenState` is `repr(C)` and contains only plain integer fields.
 unsafe impl Pod for TokenState {}
+
+#[cfg(feature = "user")]
+// SAFETY: `bpf_spin_lock` is `repr(C)` and contains only plain integer fields.
+unsafe impl Pod for bpf_spin_lock {}
 
 #[cfg(feature = "user")]
 // SAFETY: `LockedTokenState` is `repr(C)` and contains only plain integer fields.
