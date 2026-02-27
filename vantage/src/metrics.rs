@@ -255,23 +255,23 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)]) -> String {
     for (tenant, counters) in counters {
         let _ = writeln!(
             payload,
-            "vantage_tenant_pass_packets{{tenant=\"{tenant}\"}} {}",
-            counters.pass_pkts
+            "vantage_tenant_pass_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
+            tenant.src_ip, tenant.dst_port, tenant.proto, counters.pass_pkts
         );
         let _ = writeln!(
             payload,
-            "vantage_tenant_drop_packets{{tenant=\"{tenant}\"}} {}",
-            counters.drop_pkts
+            "vantage_tenant_drop_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
+            tenant.src_ip, tenant.dst_port, tenant.proto, counters.drop_pkts
         );
         let _ = writeln!(
             payload,
-            "vantage_tenant_pass_bytes{{tenant=\"{tenant}\"}} {}",
-            counters.pass_bytes
+            "vantage_tenant_pass_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
+            tenant.src_ip, tenant.dst_port, tenant.proto, counters.pass_bytes
         );
         let _ = writeln!(
             payload,
-            "vantage_tenant_drop_bytes{{tenant=\"{tenant}\"}} {}",
-            counters.drop_bytes
+            "vantage_tenant_drop_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
+            tenant.src_ip, tenant.dst_port, tenant.proto, counters.drop_bytes
         );
     }
 
@@ -297,7 +297,12 @@ mod tests {
     #[test]
     fn tenant_metrics_use_real_newlines() {
         let payload = append_counter_metrics(&[(
-            42,
+            TenantKey {
+                src_ip: 42,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0,
+            },
             Counters {
                 pass_pkts: 1,
                 drop_pkts: 2,
@@ -307,10 +312,26 @@ mod tests {
         )]);
 
         let text = payload;
-        assert!(text.contains("vantage_tenant_pass_packets{tenant=\"42\"} 1\n"));
-        assert!(text.contains("vantage_tenant_drop_packets{tenant=\"42\"} 2\n"));
-        assert!(text.contains("vantage_tenant_pass_bytes{tenant=\"42\"} 3\n"));
-        assert!(text.contains("vantage_tenant_drop_bytes{tenant=\"42\"} 4\n"));
+        assert!(
+            text.contains(
+                "vantage_tenant_pass_packets{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 1\n"
+            )
+        );
+        assert!(
+            text.contains(
+                "vantage_tenant_drop_packets{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 2\n"
+            )
+        );
+        assert!(
+            text.contains(
+                "vantage_tenant_pass_bytes{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 3\n"
+            )
+        );
+        assert!(
+            text.contains(
+                "vantage_tenant_drop_bytes{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 4\n"
+            )
+        );
         assert!(!text.contains("\\n"));
 
         let mut parsed_samples = 0_u32;

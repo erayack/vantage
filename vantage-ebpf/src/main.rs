@@ -9,20 +9,26 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use vantage_common::{
-    Counters, DropEvent, DropReason, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy,
-    TenantKey, TokenState,
+    Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY,
+    Policy, TenantKey, TokenState,
 };
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
 const GLOBAL_STATS_MAX_ENTRIES: u32 = 1;
 const GLOBAL_STATS_INDEX: u32 = 0;
+const GLOBAL_CONFIG_MAX_ENTRIES: u32 = 1;
+const GLOBAL_CONFIG_INDEX: u32 = 0;
 const DROP_EVENTS_BYTES: u32 = 1 << 17;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHER_TYPE_OFFSET: usize = 12;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_VERSION: u8 = 4;
 const IPV4_VERSION_IHL_OFFSET: usize = ETHERNET_HEADER_LEN;
+const IPV4_PROTOCOL_OFFSET: usize = ETHERNET_HEADER_LEN + 9;
 const IPV4_SRC_ADDR_OFFSET: usize = ETHERNET_HEADER_LEN + 12;
+const L4_DST_PORT_OFFSET: usize = 2;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const NO_PREALLOC_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
@@ -47,6 +53,11 @@ static GLOBAL_STATS_MAP: Array<GlobalStats> =
 
 #[map]
 #[allow(dead_code)]
+static GLOBAL_CONFIG_MAP: Array<GlobalConfig> =
+    Array::<GlobalConfig>::with_max_entries(GLOBAL_CONFIG_MAX_ENTRIES, 0);
+
+#[map]
+#[allow(dead_code)]
 static DROP_EVENTS: RingBuf = RingBuf::with_byte_size(DROP_EVENTS_BYTES, 0);
 
 #[classifier]
@@ -58,16 +69,20 @@ pub fn vantage_tc(ctx: TcContext) -> i32 {
 }
 
 fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
+    if !is_filter_enabled() {
+        return Ok(TC_ACT_OK);
+    }
+
     let now_ns = monotonic_now_ns();
     let pkt_len = u64::from(ctx.len());
 
-    let Some(tenant_key) = tenant_key_from_packet(ctx) else {
+    let Some(tenant_key) = flow_key_from_packet(ctx) else {
         // Fail-open on parse failure.
         update_global_stats(pkt_len, true, Some(DropReason::ParseFail));
         return Ok(TC_ACT_OK);
     };
 
-    let Some(policy) = read_policy(tenant_key) else {
+    let Some(policy) = read_policy_with_fallback(tenant_key) else {
         update_counters(tenant_key, pkt_len, true);
         update_global_stats(pkt_len, true, Some(DropReason::NoPolicy));
         return Ok(TC_ACT_OK);
@@ -106,7 +121,7 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
     }
 }
 
-fn tenant_key_from_packet(ctx: &TcContext) -> Option<TenantKey> {
+fn flow_key_from_packet(ctx: &TcContext) -> Option<TenantKey> {
     let packet_len = usize::try_from(ctx.len()).ok()?;
     if packet_len < ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN {
         return None;
@@ -133,8 +148,23 @@ fn tenant_key_from_packet(ctx: &TcContext) -> Option<TenantKey> {
         return None;
     }
 
+    let proto = ctx.load::<u8>(IPV4_PROTOCOL_OFFSET).ok()?;
     let src_ip = ctx.load::<u32>(IPV4_SRC_ADDR_OFFSET).ok()?;
-    Some(u32::from_be(src_ip))
+
+    let l4_offset = ETHERNET_HEADER_LEN + ip_header_len;
+    let dst_port_be = if proto_has_dst_port(proto) {
+        Some(ctx.load::<u16>(l4_offset + L4_DST_PORT_OFFSET).ok()?)
+    } else {
+        None
+    };
+    let dst_port = parse_l4_dst_port(proto, packet_len, l4_offset, dst_port_be)?;
+
+    Some(TenantKey {
+        src_ip: u32::from_be(src_ip),
+        dst_port,
+        proto,
+        _pad: 0,
+    })
 }
 
 fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> bool {
@@ -165,6 +195,66 @@ fn read_policy(key: TenantKey) -> Option<Policy> {
     // SAFETY: The map value is copied out immediately and never held across
     // helper calls, avoiding aliasing/lifetime pitfalls of raw map pointers.
     unsafe { POLICY_MAP.get(&key).copied() }
+}
+
+fn read_policy_with_fallback(key: TenantKey) -> Option<Policy> {
+    let (exact_key, proto_wildcard_key, full_wildcard_key) = fallback_policy_keys(key);
+    if let Some(policy) = read_policy(exact_key) {
+        return Some(policy);
+    }
+
+    if let Some(proto_wildcard_key) = proto_wildcard_key {
+        if let Some(policy) = read_policy(proto_wildcard_key) {
+            return Some(policy);
+        }
+    }
+
+    if let Some(full_wildcard_key) = full_wildcard_key {
+        if let Some(policy) = read_policy(full_wildcard_key) {
+            return Some(policy);
+        }
+    }
+
+    None
+}
+
+fn fallback_policy_keys(key: TenantKey) -> (TenantKey, Option<TenantKey>, Option<TenantKey>) {
+    let exact_key = key;
+    let proto_wildcard_key = if key.dst_port != 0 {
+        Some(TenantKey {
+            src_ip: key.src_ip,
+            dst_port: 0,
+            proto: key.proto,
+            _pad: 0,
+        })
+    } else {
+        None
+    };
+    let full_wildcard_key = if key.proto != 0 || key.dst_port != 0 {
+        Some(TenantKey {
+            src_ip: key.src_ip,
+            dst_port: 0,
+            proto: 0,
+            _pad: 0,
+        })
+    } else {
+        None
+    };
+
+    (exact_key, proto_wildcard_key, full_wildcard_key)
+}
+
+#[allow(unsafe_code)]
+fn is_filter_enabled() -> bool {
+    if let Some(config_ptr) = GLOBAL_CONFIG_MAP.get_ptr(GLOBAL_CONFIG_INDEX) {
+        // SAFETY: Pointer originates from a BPF array lookup at a fixed index
+        // and is dereferenced only for a single field read in this invocation.
+        let config = unsafe { &*config_ptr };
+        return config.enabled != 0;
+    }
+
+    // Fail-open when global config is missing or unreadable.
+    true
 }
 
 fn initial_state(policy: &Policy, now_ns: u64) -> TokenState {
@@ -262,7 +352,7 @@ fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_p
         ts_ns: now_ns,
         tenant_key: key,
         reason: reason.as_u8(),
-        _pad: [0; 3],
+        _pad: [0; 7],
     };
 
     let _ = DROP_EVENTS.output::<DropEvent>(event, 0);
@@ -303,6 +393,25 @@ fn monotonic_now_ns() -> u64 {
     // SAFETY: `bpf_ktime_get_ns` is a pure BPF helper that returns monotonic
     // nanoseconds and does not require additional pointer validity guarantees.
     unsafe { bpf_ktime_get_ns() }
+}
+
+const fn proto_has_dst_port(proto: u8) -> bool {
+    proto == IPPROTO_TCP || proto == IPPROTO_UDP
+}
+
+fn parse_l4_dst_port(
+    proto: u8,
+    packet_len: usize,
+    l4_offset: usize,
+    dst_port_be: Option<u16>,
+) -> Option<u16> {
+    if !proto_has_dst_port(proto) {
+        return Some(0);
+    }
+    if packet_len < l4_offset + L4_DST_PORT_OFFSET + 2 {
+        return None;
+    }
+    Some(u16::from_be(dst_port_be?))
 }
 
 #[cfg(not(test))]
@@ -369,5 +478,78 @@ mod tests {
     fn kernel_drop_event_sampling_constant_is_fixed() {
         assert_eq!(KERNEL_DROP_EVENT_SAMPLE_EVERY, 64);
         assert!(KERNEL_DROP_EVENT_SAMPLE_EVERY.is_power_of_two());
+    }
+
+    #[test]
+    fn fallback_policy_keys_use_exact_then_proto_then_full_wildcard() {
+        let key = TenantKey {
+            src_ip: 0x0a00_0001,
+            dst_port: 443,
+            proto: IPPROTO_TCP,
+            _pad: 0,
+        };
+
+        let (exact, proto_wildcard, full_wildcard) = fallback_policy_keys(key);
+
+        assert_eq!(exact, key);
+        assert_eq!(
+            proto_wildcard,
+            Some(TenantKey {
+                src_ip: key.src_ip,
+                dst_port: 0,
+                proto: IPPROTO_TCP,
+                _pad: 0,
+            })
+        );
+        assert_eq!(
+            full_wildcard,
+            Some(TenantKey {
+                src_ip: key.src_ip,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn fallback_policy_keys_skip_wildcards_when_key_is_already_wildcard() {
+        let key = TenantKey {
+            src_ip: 0x0a00_0001,
+            dst_port: 0,
+            proto: 0,
+            _pad: 0,
+        };
+
+        let (_exact, proto_wildcard, full_wildcard) = fallback_policy_keys(key);
+
+        assert_eq!(proto_wildcard, None);
+        assert_eq!(full_wildcard, None);
+    }
+
+    #[test]
+    fn parse_l4_dst_port_requires_complete_transport_header() {
+        let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let packet_len = l4_offset + L4_DST_PORT_OFFSET + 1;
+        let parsed = parse_l4_dst_port(IPPROTO_TCP, packet_len, l4_offset, Some(8080_u16.to_be()));
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_l4_dst_port_extracts_port_for_tcp_udp() {
+        let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let packet_len = l4_offset + L4_DST_PORT_OFFSET + 2;
+        let tcp = parse_l4_dst_port(IPPROTO_TCP, packet_len, l4_offset, Some(443_u16.to_be()));
+        let udp = parse_l4_dst_port(IPPROTO_UDP, packet_len, l4_offset, Some(53_u16.to_be()));
+        assert_eq!(tcp, Some(443));
+        assert_eq!(udp, Some(53));
+    }
+
+    #[test]
+    fn parse_l4_dst_port_uses_wildcard_for_non_tcp_udp() {
+        let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let packet_len = l4_offset;
+        let parsed = parse_l4_dst_port(1, packet_len, l4_offset, None);
+        assert_eq!(parsed, Some(0));
     }
 }

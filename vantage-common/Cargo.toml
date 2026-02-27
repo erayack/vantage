@@ -36,10 +36,11 @@ mem_forget = { level = "deny", priority = 8 }
 
 [features]
 default = []
-user = ["aya"]
+user = ["aya", "serde"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, default-features = false, features = ["derive"] }
 
 [lib]
 path = "src/lib.rs"

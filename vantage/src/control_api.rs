@@ -229,6 +229,7 @@ mod tests {
     struct InMemoryMapOps {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
         global_stats: GlobalStats,
+        global_enabled: Mutex<bool>,
     }
 
     impl InMemoryMapOps {
@@ -236,6 +237,7 @@ mod tests {
             Self {
                 policies: Mutex::new(BTreeMap::new()),
                 global_stats: Self::default_global_stats(),
+                global_enabled: Mutex::new(true),
             }
         }
 
@@ -243,6 +245,7 @@ mod tests {
             Self {
                 policies: Mutex::new(BTreeMap::new()),
                 global_stats,
+                global_enabled: Mutex::new(true),
             }
         }
 
@@ -284,6 +287,25 @@ mod tests {
 
         fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
             Ok(self.global_stats)
+        }
+
+        fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
+            {
+                let mut current = self
+                    .global_enabled
+                    .lock()
+                    .map_err(|_| MapError::LockPoisoned)?;
+                *current = enabled;
+            }
+            Ok(())
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            let current = self
+                .global_enabled
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?;
+            Ok(*current)
         }
     }
 

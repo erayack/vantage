@@ -15,7 +15,7 @@ use vantage_common::{DropEvent, DropReason, TenantKey};
 const DROP_EVENTS_MAP: &str = "DROP_EVENTS";
 const TS_NS_OFFSET: usize = 0;
 const TENANT_KEY_OFFSET: usize = 8;
-const REASON_OFFSET: usize = 12;
+const REASON_OFFSET: usize = 16;
 const MAX_EVENTS_PER_WAKE: usize = 1024;
 
 pub(crate) type RingBufferHandle = RingBuf<MapData>;
@@ -82,7 +82,7 @@ pub(crate) async fn run_drop_event_consumer(
                             seen_events = seen_events.saturating_add(1);
                             if seen_events.is_multiple_of(u64::from(log_sample_n)) {
                                 info!(
-                                    tenant = event.tenant,
+                                    tenant = ?event.tenant,
                                     reason = event.reason,
                                     ts_ns = event.ts_ns,
                                     log_sample_n,
@@ -138,16 +138,27 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
         return None;
     }
 
-    let tenant = u32::from_ne_bytes(
+    let src_ip = u32::from_ne_bytes(
         payload[TENANT_KEY_OFFSET..TENANT_KEY_OFFSET + 4]
             .try_into()
             .ok()?,
     );
+    let dst_port = u16::from_ne_bytes(
+        payload[TENANT_KEY_OFFSET + 4..TENANT_KEY_OFFSET + 6]
+            .try_into()
+            .ok()?,
+    );
+    let proto = *payload.get(TENANT_KEY_OFFSET + 6)?;
     let ts_ns = u64::from_ne_bytes(payload[TS_NS_OFFSET..TS_NS_OFFSET + 8].try_into().ok()?);
     let reason_code = *payload.get(REASON_OFFSET)?;
 
     Some(DecodedDropEvent {
-        tenant,
+        tenant: TenantKey {
+            src_ip,
+            dst_port,
+            proto,
+            _pad: 0,
+        },
         ts_ns,
         reason: reason_name(reason_code),
     })
@@ -169,11 +180,15 @@ const fn reason_name(reason: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{mem::size_of, time::Duration};
 
     use tokio::sync::watch;
+    use vantage_common::{DropEvent, DropReason, TenantKey};
 
-    use super::should_stop_after_shutdown_change;
+    use super::{
+        REASON_OFFSET, TENANT_KEY_OFFSET, TS_NS_OFFSET, decode_drop_event,
+        should_stop_after_shutdown_change,
+    };
 
     #[tokio::test]
     async fn shutdown_channel_stays_open_while_sender_is_retained() {
@@ -198,5 +213,45 @@ mod tests {
             should_stop_after_shutdown_change(changed.is_err(), *rx.borrow()),
             "closed shutdown channel should stop the consumer loop"
         );
+    }
+
+    #[test]
+    fn drop_event_decode_round_trips_contract_layout() {
+        let event = DropEvent {
+            ts_ns: 1234,
+            tenant_key: TenantKey {
+                src_ip: 0x0a00_0001,
+                dst_port: 443,
+                proto: 6,
+                _pad: 0,
+            },
+            reason: DropReason::NoTokens.as_u8(),
+            _pad: [0; 7],
+        };
+        let mut payload = [0_u8; size_of::<DropEvent>()];
+        payload[TS_NS_OFFSET..TS_NS_OFFSET + 8].copy_from_slice(&event.ts_ns.to_ne_bytes());
+        payload[TENANT_KEY_OFFSET..TENANT_KEY_OFFSET + 4]
+            .copy_from_slice(&event.tenant_key.src_ip.to_ne_bytes());
+        payload[TENANT_KEY_OFFSET + 4..TENANT_KEY_OFFSET + 6]
+            .copy_from_slice(&event.tenant_key.dst_port.to_ne_bytes());
+        payload[TENANT_KEY_OFFSET + 6] = event.tenant_key.proto;
+        payload[REASON_OFFSET] = event.reason;
+
+        let decoded = decode_drop_event(&payload);
+        let Some(decoded) = decoded else {
+            panic!("drop event payload should decode");
+        };
+
+        assert_eq!(decoded.tenant, event.tenant_key);
+        assert_eq!(decoded.ts_ns, event.ts_ns);
+        assert_eq!(decoded.reason, "no_tokens");
+    }
+
+    #[test]
+    fn drop_event_offsets_match_shared_contract() {
+        assert_eq!(size_of::<DropEvent>(), 24);
+        assert_eq!(TS_NS_OFFSET, 0);
+        assert_eq!(TENANT_KEY_OFFSET, 8);
+        assert_eq!(REASON_OFFSET, 16);
     }
 }

@@ -113,10 +113,13 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         log_sample_n: config.drop_event_log_sample_n,
         log_enabled: config.drop_event_log_enabled,
     };
+    let maps = MapClient::new(Arc::new(std::sync::Mutex::new(ebpf)));
+    maps.set_global_enabled(true)
+        .context("failed to initialize GLOBAL_CONFIG_MAP enabled state")?;
     let state = AppState {
         config: config.clone(),
         drop_events,
-        maps: MapClient::new(Arc::new(std::sync::Mutex::new(ebpf))),
+        maps,
         metrics: metrics_state,
     };
 
@@ -294,6 +297,14 @@ mod tests {
                     parse_fail: 0,
                 },
             })
+        }
+
+        fn set_global_enabled(&self, _enabled: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            Ok(true)
         }
     }
 

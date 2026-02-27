@@ -24,7 +24,12 @@ impl TenantRef {
 
     pub(crate) const fn to_tenant_key(self) -> TenantKey {
         match self {
-            Self::SrcIp(key) => key,
+            Self::SrcIp(key) => TenantKey {
+                src_ip: key,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0,
+            },
         }
     }
 }
@@ -42,6 +47,8 @@ pub(crate) enum TenantParseError {
 
 #[cfg(test)]
 mod tests {
+    use vantage_common::TenantKey;
+
     use super::TenantRef;
 
     #[test]
@@ -80,6 +87,14 @@ mod tests {
     #[test]
     fn converts_tenant_ref_to_key() {
         let tenant = TenantRef::SrcIp(42);
-        assert_eq!(tenant.to_tenant_key(), 42);
+        assert_eq!(
+            tenant.to_tenant_key(),
+            TenantKey {
+                src_ip: 42,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0
+            }
+        );
     }
 }

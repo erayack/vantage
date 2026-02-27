@@ -5,9 +5,10 @@ use aya::{
     maps::{Array, HashMap},
 };
 use thiserror::Error;
-use vantage_common::{Counters, GlobalStats, Policy, TenantKey};
+use vantage_common::{Counters, GlobalConfig, GlobalStats, Policy, TenantKey};
 
 const GLOBAL_STATS_INDEX: u32 = 0;
+const GLOBAL_CONFIG_INDEX: u32 = 0;
 
 #[derive(Debug, Error)]
 pub enum MapError {
@@ -24,6 +25,8 @@ pub(crate) trait MapOps: Send + Sync {
     fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError>;
     fn read_global_stats(&self) -> Result<GlobalStats, MapError>;
+    fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError>;
+    fn get_global_enabled(&self) -> Result<bool, MapError>;
 }
 
 struct EbpfMapOps {
@@ -81,6 +84,24 @@ impl MapClient {
     /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
     pub fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
         self.inner.read_global_stats()
+    }
+
+    /// Sets `GLOBAL_CONFIG_MAP[0].enabled` to toggle data-path filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map write fails.
+    pub fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
+        self.inner.set_global_enabled(enabled)
+    }
+
+    /// Reads `GLOBAL_CONFIG_MAP[0].enabled`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
+    pub fn get_global_enabled(&self) -> Result<bool, MapError> {
+        self.inner.get_global_enabled()
     }
 }
 
@@ -154,6 +175,39 @@ impl MapOps for EbpfMapOps {
 
         Ok(stats)
     }
+
+    fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        {
+            let map = ebpf
+                .map_mut("GLOBAL_CONFIG_MAP")
+                .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
+            let mut global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
+            let config = GlobalConfig {
+                enabled: u8::from(enabled),
+                _pad: [0; 7],
+            };
+            global_config_map.set(GLOBAL_CONFIG_INDEX, config, 0)?;
+        }
+        drop(ebpf);
+
+        Ok(())
+    }
+
+    fn get_global_enabled(&self) -> Result<bool, MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let enabled = {
+            let map = ebpf
+                .map_mut("GLOBAL_CONFIG_MAP")
+                .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
+            let global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
+            let config = global_config_map.get(&GLOBAL_CONFIG_INDEX, 0)?;
+            config.enabled != 0
+        };
+        drop(ebpf);
+
+        Ok(enabled)
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +225,7 @@ mod tests {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
         counters: Vec<(TenantKey, Counters)>,
         global_stats: GlobalStats,
+        global_enabled: Mutex<bool>,
     }
 
     impl FixtureMapOps {
@@ -179,6 +234,7 @@ mod tests {
                 policies: Mutex::new(BTreeMap::new()),
                 counters,
                 global_stats,
+                global_enabled: Mutex::new(false),
             })
         }
     }
@@ -206,6 +262,25 @@ mod tests {
 
         fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
             Ok(self.global_stats)
+        }
+
+        fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
+            {
+                let mut current = self
+                    .global_enabled
+                    .lock()
+                    .map_err(|_| MapError::LockPoisoned)?;
+                *current = enabled;
+            }
+            Ok(())
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            let current = self
+                .global_enabled
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?;
+            Ok(*current)
         }
     }
 
@@ -244,7 +319,12 @@ mod tests {
     #[test]
     fn collect_counters_preserves_fixture_values() {
         let counters = vec![(
-            42,
+            TenantKey {
+                src_ip: 42,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0,
+            },
             Counters {
                 pass_pkts: 5,
                 drop_pkts: 1,
@@ -260,7 +340,15 @@ mod tests {
         };
 
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].0, 42);
+        assert_eq!(
+            collected[0].0,
+            TenantKey {
+                src_ip: 42,
+                dst_port: 0,
+                proto: 0,
+                _pad: 0
+            }
+        );
         assert_eq!(collected[0].1.pass_pkts, 5);
         assert_eq!(collected[0].1.drop_pkts, 1);
         assert_eq!(collected[0].1.pass_bytes, 500);
@@ -278,9 +366,16 @@ mod tests {
             _pad: [0; 7],
         };
 
-        let inserted = maps.upsert_policy(10, policy);
+        let key = TenantKey {
+            src_ip: 10,
+            dst_port: 0,
+            proto: 0,
+            _pad: 0,
+        };
+
+        let inserted = maps.upsert_policy(key, policy);
         assert!(inserted.is_ok(), "policy insert should succeed");
-        let deleted = maps.delete_policy(10);
+        let deleted = maps.delete_policy(key);
         assert!(deleted.is_ok(), "policy delete should succeed");
 
         match fixture.policies.lock() {
@@ -291,5 +386,25 @@ mod tests {
                 panic!("fixture storage lock should not be poisoned: {error}");
             }
         }
+    }
+
+    #[test]
+    fn global_enabled_round_trip_uses_fixture_storage() {
+        let maps = MapClient::from_ops(FixtureMapOps::with_data(Vec::new(), sample_global_stats()));
+
+        let initially_enabled = maps.get_global_enabled();
+        let Ok(initially_enabled) = initially_enabled else {
+            panic!("global enabled should be readable");
+        };
+        assert!(!initially_enabled);
+
+        let set = maps.set_global_enabled(true);
+        assert!(set.is_ok(), "global enabled should be writable");
+
+        let enabled = maps.get_global_enabled();
+        let Ok(enabled) = enabled else {
+            panic!("global enabled should be readable after write");
+        };
+        assert!(enabled);
     }
 }
