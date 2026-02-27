@@ -526,6 +526,7 @@ mod tests {
         let counters = vec![(
             TenantKey {
                 src_ip: 42,
+                http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
                 _pad: 0,
@@ -549,6 +550,7 @@ mod tests {
             collected[0].0,
             TenantKey {
                 src_ip: 42,
+                http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
                 _pad: 0
@@ -573,6 +575,7 @@ mod tests {
 
         let key = TenantKey {
             src_ip: 10,
+            http_path_hash: 0,
             dst_port: 0,
             proto: 0,
             _pad: 0,
@@ -662,18 +665,21 @@ mod tests {
         let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
         let exact_key = TenantKey {
             src_ip: 0x0a01_0203,
+            http_path_hash: 0,
             proto: 6,
             dst_port: 443,
             _pad: 0,
         };
         let proto_wildcard_key = TenantKey {
             src_ip: exact_key.src_ip,
+            http_path_hash: exact_key.http_path_hash,
             proto: exact_key.proto,
             dst_port: 0,
             _pad: 0,
         };
         let full_wildcard_key = TenantKey {
             src_ip: exact_key.src_ip,
+            http_path_hash: exact_key.http_path_hash,
             proto: 0,
             dst_port: 0,
             _pad: 0,

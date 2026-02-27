@@ -3,19 +3,35 @@
 #[cfg(feature = "user")]
 use aya::Pod;
 
-/// Flow-aware identity key derived from L2/L3/L4 packet metadata only.
+/// Flow-aware identity key derived from L2/L3/L4 metadata plus optional
+/// userspace-provided HTTP path hash selector.
 ///
 /// No application payload fields are part of kernel-side key extraction.
-/// `dst_port` and `proto` support wildcard semantics for fallback matching.
+/// `dst_port`, `proto`, and `http_path_hash` support wildcard semantics for
+/// fallback matching (`0` => wildcard).
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
 #[cfg_attr(feature = "user", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantKey {
     pub src_ip: u32,
-    pub dst_port: u16, // 0 => wildcard
-    pub proto: u8,     // 0 => wildcard, 6 => TCP, 17 => UDP
+    pub http_path_hash: u32, // 0 => wildcard
+    pub dst_port: u16,       // 0 => wildcard
+    pub proto: u8,           // 0 => wildcard, 6 => TCP, 17 => UDP
     pub _pad: u8,
+}
+
+/// Computes 32-bit FNV-1a hash for HTTP path selector keying.
+#[must_use]
+pub const fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    let mut idx = 0_usize;
+    while idx < bytes.len() {
+        hash ^= bytes[idx] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        idx += 1;
+    }
+    hash
 }
 
 #[repr(u8)]
@@ -36,6 +52,7 @@ pub const fn fallback_policy_keys(
     let proto_wildcard_key = if key.dst_port != 0 {
         Some(TenantKey {
             src_ip: key.src_ip,
+            http_path_hash: key.http_path_hash,
             dst_port: 0,
             proto: key.proto,
             _pad: 0,
@@ -46,6 +63,7 @@ pub const fn fallback_policy_keys(
     let full_wildcard_key = if key.proto != 0 || key.dst_port != 0 {
         Some(TenantKey {
             src_ip: key.src_ip,
+            http_path_hash: key.http_path_hash,
             dst_port: 0,
             proto: 0,
             _pad: 0,

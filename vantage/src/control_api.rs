@@ -12,7 +12,7 @@ use crate::{
     AppState,
     map_client::{MapError, ResolvedPolicy},
     metrics::{CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async},
-    tenant::{FlowProto, TenantParseError, TenantRef, normalized_flow_key},
+    tenant::{FlowProto, TenantParseError, TenantRef, compute_http_path_hash, normalized_flow_key},
 };
 
 const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -24,6 +24,8 @@ pub(crate) struct PutPolicyRequest {
     pub enabled: bool,
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_path: Option<String>,
+    pub http_path_hash: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,12 +37,16 @@ pub(crate) struct PutEnabledRequest {
 pub(crate) struct DeletePolicyQuery {
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_path: Option<String>,
+    pub http_path_hash: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ResolvePolicyQuery {
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_path: Option<String>,
+    pub http_path_hash: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,8 +216,10 @@ pub(crate) async fn put_policy(
     Json(req): Json<PutPolicyRequest>,
 ) -> Result<Json<PolicyUpsertResponse>, ApiError> {
     let proto = parse_proto(req.proto.as_deref())?;
+    let http_path_hash = parse_http_path_hash(req.http_path.as_deref(), req.http_path_hash)?;
     let tenant = TenantRef::parse(&tenant)?
         .with_flow(proto, req.dst_port)?
+        .with_http_path_hash(http_path_hash)
         .to_tenant_key();
     let maps = app.maps;
     let policy = Policy {
@@ -275,8 +283,10 @@ pub(crate) async fn delete_policy(
     State(app): State<AppState>,
 ) -> Result<Json<PolicyDeleteResponse>, ApiError> {
     let proto = parse_proto(query.proto.as_deref())?;
+    let http_path_hash = parse_http_path_hash(query.http_path.as_deref(), query.http_path_hash)?;
     let tenant = TenantRef::parse(&tenant)?
         .with_flow(proto, query.dst_port)?
+        .with_http_path_hash(http_path_hash)
         .to_tenant_key();
     let maps = app.maps;
     let deleted = maps.get_policy(tenant)?.is_some();
@@ -303,8 +313,10 @@ pub(crate) async fn resolve_policy(
     State(app): State<AppState>,
 ) -> Result<Json<ResolvePolicyResponse>, ApiError> {
     let proto = parse_proto(query.proto.as_deref())?;
+    let http_path_hash = parse_http_path_hash(query.http_path.as_deref(), query.http_path_hash)?;
     let requested = TenantRef::parse(&tenant)?
         .with_flow(proto, query.dst_port)?
+        .with_http_path_hash(http_path_hash)
         .to_tenant_key();
     let effective = app.maps.resolve_policy(requested)?;
 
@@ -385,6 +397,21 @@ fn parse_proto(proto: Option<&str>) -> Result<Option<FlowProto>, TenantParseErro
     }
 }
 
+fn parse_http_path_hash(
+    http_path: Option<&str>,
+    explicit_hash: Option<u32>,
+) -> Result<Option<u32>, TenantParseError> {
+    let computed_hash = http_path.map(compute_http_path_hash);
+    match (computed_hash, explicit_hash) {
+        (Some(computed), Some(explicit)) if computed != explicit => {
+            Err(TenantParseError::PathHashMismatch)
+        }
+        (Some(computed), _) => Ok(Some(computed)),
+        (None, Some(explicit)) => Ok(Some(explicit)),
+        (None, None) => Ok(None),
+    }
+}
+
 const fn policy_precedence_contract() -> &'static str {
     "exact(src_ip,proto,dst_port) > proto_wildcard(src_ip,proto,0) > full_wildcard(src_ip,0,0)"
 }
@@ -454,6 +481,7 @@ mod tests {
         AppState, DropEventRuntime, MetricsState,
         config::Config,
         map_client::{MapClient, MapError, MapOps},
+        tenant::compute_http_path_hash,
     };
 
     struct InMemoryMapOps {
@@ -636,6 +664,7 @@ mod tests {
                 (
                     TenantKey {
                         src_ip: 167_838_211,
+                        http_path_hash: 0,
                         dst_port: 443,
                         proto: 6,
                         _pad: 0,
@@ -650,6 +679,7 @@ mod tests {
                 (
                     TenantKey {
                         src_ip: 167_838_212,
+                        http_path_hash: 0,
                         dst_port: 53,
                         proto: 17,
                         _pad: 0,
@@ -698,6 +728,7 @@ mod tests {
             counters: vec![(
                 TenantKey {
                     src_ip: 167_838_211,
+                    http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
                     _pad: 0,
@@ -864,6 +895,7 @@ mod tests {
             Ok(policies) => {
                 let tenant = TenantKey {
                     src_ip: 167_838_211,
+                    http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
                     _pad: 0,
@@ -877,6 +909,76 @@ mod tests {
                 panic!("fixture lock should not be poisoned: {error}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn put_policy_accepts_http_path_and_stores_hash_only() {
+        let fixture = Arc::new(InMemoryMapOps::new());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_path":"/predict"}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        match fixture.policies.lock() {
+            Ok(policies) => {
+                let tenant = TenantKey {
+                    src_ip: 167_838_211,
+                    http_path_hash: compute_http_path_hash("/predict"),
+                    dst_port: 443,
+                    proto: 6,
+                    _pad: 0,
+                };
+                assert!(
+                    policies.contains_key(&tenant),
+                    "policy key should store only numeric hash selector"
+                );
+            }
+            Err(error) => {
+                panic!("fixture lock should not be poisoned: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_mismatched_http_path_and_hash() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_path":"/predict","http_path_hash":1}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1285,7 +1387,7 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert_eq!(
             top[0]["flow"],
-            serde_json::json!("src=10.1.2.3|proto=tcp|dport=443")
+            serde_json::json!("src=10.1.2.3|proto=tcp|dport=443|path_hash=*")
         );
     }
 
@@ -1295,6 +1397,7 @@ mod tests {
             (
                 TenantKey {
                     src_ip: 2,
+                    http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
                     _pad: 0,
@@ -1309,6 +1412,7 @@ mod tests {
             (
                 TenantKey {
                     src_ip: 1,
+                    http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
                     _pad: 0,
@@ -1323,6 +1427,7 @@ mod tests {
             (
                 TenantKey {
                     src_ip: 3,
+                    http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
                     _pad: 0,
@@ -1408,7 +1513,7 @@ mod tests {
         let Ok(text) = text else {
             panic!("metrics response should be utf-8");
         };
-        assert!(text.contains("flow=\"src=10.1.2.3|proto=tcp|dport=443\""));
+        assert!(text.contains("flow=\"src=10.1.2.3|proto=tcp|dport=443|path_hash=*\""));
         assert!(text.contains("src_ip=\"10.1.2.3\""));
     }
 }

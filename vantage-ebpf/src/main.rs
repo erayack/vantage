@@ -34,24 +34,27 @@ const L4_DST_PORT_REL_OFFSET: usize = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
-const NO_PREALLOC_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
+const HASH_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
+const STATE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[map]
 static POLICY_MAP: HashMap<TenantKey, Policy> =
-    HashMap::<TenantKey, Policy>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
+    HashMap::<TenantKey, Policy>::with_max_entries(HASH_MAP_MAX_ENTRIES, HASH_MAP_FLAGS);
 
 #[map]
 #[allow(dead_code)]
+// v0.3.0 contract: this map must remain LRU to bound token-state memory
+// as flow-key cardinality grows. Under pressure, cold entries are evicted.
 static STATE_MAP: LruHashMap<TenantKey, LockedTokenState> =
     LruHashMap::<TenantKey, LockedTokenState>::with_max_entries(
         STATE_MAP_MAX_ENTRIES,
-        NO_PREALLOC_MAP_FLAGS,
+        STATE_MAP_FLAGS,
     );
 
 #[map]
 #[allow(dead_code)]
 static COUNTERS_MAP: HashMap<TenantKey, Counters> =
-    HashMap::<TenantKey, Counters>::with_max_entries(HASH_MAP_MAX_ENTRIES, NO_PREALLOC_MAP_FLAGS);
+    HashMap::<TenantKey, Counters>::with_max_entries(HASH_MAP_MAX_ENTRIES, HASH_MAP_FLAGS);
 
 #[map]
 #[allow(dead_code)]
@@ -137,6 +140,7 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
     if !flow_keys_live {
         return Some(TenantKey {
             src_ip,
+            http_path_hash: 0,
             dst_port: 0,
             proto: 0,
             _pad: 0,
@@ -147,6 +151,7 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
 
     Some(TenantKey {
         src_ip,
+        http_path_hash: 0,
         dst_port,
         proto,
         _pad: 0,
@@ -541,6 +546,7 @@ mod tests {
     fn fallback_policy_keys_use_exact_then_proto_then_full_wildcard() {
         let key = TenantKey {
             src_ip: 0x0a00_0001,
+            http_path_hash: 0x1234,
             dst_port: 443,
             proto: IPPROTO_TCP,
             _pad: 0,
@@ -553,6 +559,7 @@ mod tests {
             proto_wildcard,
             Some(TenantKey {
                 src_ip: key.src_ip,
+                http_path_hash: key.http_path_hash,
                 dst_port: 0,
                 proto: IPPROTO_TCP,
                 _pad: 0,
@@ -562,6 +569,7 @@ mod tests {
             full_wildcard,
             Some(TenantKey {
                 src_ip: key.src_ip,
+                http_path_hash: key.http_path_hash,
                 dst_port: 0,
                 proto: 0,
                 _pad: 0,
@@ -573,6 +581,7 @@ mod tests {
     fn fallback_policy_keys_skip_wildcards_when_key_is_already_wildcard() {
         let key = TenantKey {
             src_ip: 0x0a00_0001,
+            http_path_hash: 0,
             dst_port: 0,
             proto: 0,
             _pad: 0,

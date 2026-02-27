@@ -347,6 +347,7 @@ mod tests {
             &[(
                 TenantKey {
                     src_ip: 167_838_211,
+                    http_path_hash: 0,
                     dst_port: 0,
                     proto: 0,
                     _pad: 0,
@@ -364,12 +365,12 @@ mod tests {
         let text = payload;
         assert!(
             text.contains(
-                "vantage_tenant_pass_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*\"} 1\n"
+                "vantage_tenant_pass_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*|path_hash=*\"} 1\n"
             )
         );
         assert!(
             text.contains(
-                "vantage_tenant_drop_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*\"} 2\n"
+                "vantage_tenant_drop_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*|path_hash=*\"} 2\n"
             )
         );
         assert!(!text.contains("\\n"));
@@ -381,6 +382,7 @@ mod tests {
             &[(
                 TenantKey {
                     src_ip: 42,
+                    http_path_hash: 0,
                     dst_port: 53,
                     proto: 17,
                     _pad: 0,
@@ -432,6 +434,7 @@ mod tests {
                 (
                     TenantKey {
                         src_ip: 1,
+                        http_path_hash: 0,
                         dst_port: 80,
                         proto: 6,
                         _pad: 0,
@@ -446,6 +449,7 @@ mod tests {
                 (
                     TenantKey {
                         src_ip: 2,
+                        http_path_hash: 0,
                         dst_port: 53,
                         proto: 17,
                         _pad: 0,

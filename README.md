@@ -13,7 +13,10 @@ Kernel-level per-tenant admission controller built with Rust and eBPF. Enforces 
 - Stable + nightly Rust: `rustup toolchain install stable nightly --component rust-src`
 - `bpf-linker`: `cargo install bpf-linker`
 - Linux kernel with `tc` + eBPF support (5.8+)
+- CgroupV2 mounted on host (required for cgroup-based kernel identity extraction): `mount | grep cgroup2`
 - `just` (optional, for the quality gate): `cargo install just`
+
+If `cgroup2` is not mounted, daemon startup fails with a clear prerequisite error.
 
 ## Build & Run
 
@@ -58,6 +61,17 @@ GET    /debug/snapshot           # benchmark snapshot: global stats + CPU sample
 
 ```json
 { "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true, "proto": "tcp", "dst_port": 443 }
+```
+
+`PUT /policy` optionally accepts HTTP path selectors; userspace hashes paths with
+FNV-1a (32-bit) and writes only numeric `http_path_hash` into policy-map keys:
+
+```json
+{ "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true, "proto": "tcp", "dst_port": 8080, "http_path": "/predict" }
+```
+
+```json
+{ "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true, "proto": "tcp", "dst_port": 8080, "http_path_hash": 4021474487 }
 ```
 
 Policy precedence is explicit and enforced consistently across API and kernel data-path:

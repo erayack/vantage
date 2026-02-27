@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, str::FromStr};
 
 use thiserror::Error;
-use vantage_common::TenantKey;
+use vantage_common::{TenantKey, fnv1a_32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlowProto {
@@ -35,6 +35,7 @@ pub(crate) struct TenantRef {
     src_ip: u32,
     proto: Option<FlowProto>,
     dst_port: Option<u16>,
+    http_path_hash: Option<u32>,
 }
 
 impl TenantRef {
@@ -52,6 +53,7 @@ impl TenantRef {
             src_ip,
             proto: None,
             dst_port: None,
+            http_path_hash: None,
         })
     }
 
@@ -73,9 +75,18 @@ impl TenantRef {
         Ok(self)
     }
 
+    pub(crate) const fn with_http_path_hash(mut self, http_path_hash: Option<u32>) -> Self {
+        self.http_path_hash = http_path_hash;
+        self
+    }
+
     pub(crate) const fn to_tenant_key(self) -> TenantKey {
         TenantKey {
             src_ip: self.src_ip,
+            http_path_hash: match self.http_path_hash {
+                Some(hash) => hash,
+                None => 0,
+            },
             dst_port: match self.dst_port {
                 Some(port) => port,
                 None => 0,
@@ -110,11 +121,24 @@ pub(crate) fn normalized_flow_key(tenant: TenantKey) -> String {
     };
 
     format!(
-        "src={}|proto={}|dport={}",
+        "src={}|proto={}|dport={}|path_hash={}",
         src_ip_label(tenant.src_ip),
         proto_label(tenant.proto),
-        port
+        port,
+        path_hash_label(tenant.http_path_hash)
     )
+}
+
+pub(crate) fn path_hash_label(http_path_hash: u32) -> String {
+    if http_path_hash == 0 {
+        "*".to_owned()
+    } else {
+        format!("{http_path_hash:#010x}")
+    }
+}
+
+pub(crate) const fn compute_http_path_hash(http_path: &str) -> u32 {
+    fnv1a_32(http_path.as_bytes())
 }
 
 fn parse_ipv4(raw: &str) -> Result<TenantRef, TenantParseError> {
@@ -123,6 +147,7 @@ fn parse_ipv4(raw: &str) -> Result<TenantRef, TenantParseError> {
         src_ip: u32::from(addr),
         proto: None,
         dst_port: None,
+        http_path_hash: None,
     })
 }
 
@@ -136,13 +161,18 @@ pub(crate) enum TenantParseError {
     MissingDstPort,
     #[error("proto is required when dst_port is set")]
     MissingProto,
+    #[error("http_path and http_path_hash mismatch")]
+    PathHashMismatch,
 }
 
 #[cfg(test)]
 mod tests {
     use vantage_common::TenantKey;
 
-    use super::{FlowProto, TenantRef, normalized_flow_key, proto_label, src_ip_label};
+    use super::{
+        FlowProto, TenantRef, compute_http_path_hash, normalized_flow_key, path_hash_label,
+        proto_label, src_ip_label,
+    };
 
     #[test]
     fn parses_canonical_ip_prefix() {
@@ -156,6 +186,7 @@ mod tests {
                 src_ip: 167_838_211,
                 proto: None,
                 dst_port: None,
+                http_path_hash: None,
             }
         );
     }
@@ -172,6 +203,7 @@ mod tests {
                 src_ip: 167_838_211,
                 proto: None,
                 dst_port: None,
+                http_path_hash: None,
             }
         );
     }
@@ -188,6 +220,7 @@ mod tests {
                 src_ip: 167_838_211,
                 proto: None,
                 dst_port: None,
+                http_path_hash: None,
             }
         );
     }
@@ -204,11 +237,13 @@ mod tests {
             src_ip: 42,
             proto: None,
             dst_port: None,
+            http_path_hash: None,
         };
         assert_eq!(
             tenant.to_tenant_key(),
             TenantKey {
                 src_ip: 42,
+                http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
                 _pad: 0
@@ -231,6 +266,7 @@ mod tests {
             tenant.to_tenant_key(),
             TenantKey {
                 src_ip: 167_838_211,
+                http_path_hash: 0,
                 dst_port: 443,
                 proto: 6,
                 _pad: 0
@@ -271,13 +307,24 @@ mod tests {
     fn builds_normalized_flow_key() {
         let tenant = TenantKey {
             src_ip: 167_838_211,
+            http_path_hash: 0x1234_abcd,
             dst_port: 443,
             proto: 6,
             _pad: 0,
         };
         assert_eq!(
             normalized_flow_key(tenant),
-            "src=10.1.2.3|proto=tcp|dport=443"
+            "src=10.1.2.3|proto=tcp|dport=443|path_hash=0x1234abcd"
         );
+    }
+
+    #[test]
+    fn computes_fnv1a_http_path_hash() {
+        assert_eq!(compute_http_path_hash("/predict"), 0xefb2_d4b7);
+    }
+
+    #[test]
+    fn wildcard_hash_label_is_star() {
+        assert_eq!(path_hash_label(0), "*");
     }
 }

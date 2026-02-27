@@ -3,6 +3,7 @@ pub mod control_api;
 pub mod events;
 pub mod map_client;
 pub mod metrics;
+pub mod prereqs;
 pub mod tenant;
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use crate::{
     },
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
+    prereqs::ensure_cgroup_v2_mounted,
 };
 
 #[derive(Clone)]
@@ -93,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
 
 pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     setup_memlock_compatibility();
+    ensure_cgroup_v2_mounted().context(
+        "host prerequisite check failed: cgroup-v2 must be mounted before starting vantage",
+    )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(

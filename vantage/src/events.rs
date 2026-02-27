@@ -150,12 +150,17 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
             .try_into()
             .ok()?,
     );
-    let dst_port = u16::from_ne_bytes(
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 6]
+    let http_path_hash = u32::from_ne_bytes(
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 8]
             .try_into()
             .ok()?,
     );
-    let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 6)?;
+    let dst_port = u16::from_ne_bytes(
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 10]
+            .try_into()
+            .ok()?,
+    );
+    let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 10)?;
     let ts_ns = u64::from_ne_bytes(
         payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
             .try_into()
@@ -166,6 +171,7 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
     Some(DecodedDropEvent {
         tenant: TenantKey {
             src_ip,
+            http_path_hash,
             dst_port,
             proto,
             _pad: 0,
@@ -232,6 +238,7 @@ mod tests {
             ts_ns: 1234,
             tenant_key: TenantKey {
                 src_ip: 0x0a00_0001,
+                http_path_hash: 0x1234_abcd,
                 dst_port: 443,
                 proto: 6,
                 _pad: 0,
@@ -244,9 +251,11 @@ mod tests {
             .copy_from_slice(&event.ts_ns.to_ne_bytes());
         payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 4]
             .copy_from_slice(&event.tenant_key.src_ip.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 6]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 8]
+            .copy_from_slice(&event.tenant_key.http_path_hash.to_ne_bytes());
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 10]
             .copy_from_slice(&event.tenant_key.dst_port.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 6] = event.tenant_key.proto;
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 10] = event.tenant_key.proto;
         payload[DROP_EVENT_REASON_OFFSET] = event.reason;
 
         let decoded = decode_drop_event(&payload);
@@ -261,7 +270,7 @@ mod tests {
 
     #[test]
     fn drop_event_offsets_match_shared_contract() {
-        assert_eq!(size_of::<DropEvent>(), 24);
+        assert_eq!(size_of::<DropEvent>(), 32);
         assert_eq!(DROP_EVENT_TS_NS_OFFSET, 0);
         assert_eq!(DROP_EVENT_TENANT_KEY_OFFSET, 8);
         assert_eq!(
