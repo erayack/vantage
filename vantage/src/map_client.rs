@@ -5,7 +5,10 @@ use aya::{
     maps::{Array, HashMap},
 };
 use thiserror::Error;
-use vantage_common::{Counters, GlobalConfig, GlobalStats, Policy, TenantKey};
+use vantage_common::{
+    Counters, GlobalConfig, GlobalStats, Policy, PolicyMatchLevel, TenantKey, fallback_policy_keys,
+    policy_match_level,
+};
 
 const GLOBAL_STATS_INDEX: u32 = 0;
 const GLOBAL_CONFIG_INDEX: u32 = 0;
@@ -20,13 +23,25 @@ pub enum MapError {
     Map(#[from] aya::maps::MapError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPolicy {
+    pub requested: TenantKey,
+    pub matched: TenantKey,
+    pub match_level: PolicyMatchLevel,
+    pub policy: Policy,
+}
+
 pub(crate) trait MapOps: Send + Sync {
     fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError>;
     fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
+    fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError>;
     fn read_global_stats(&self) -> Result<GlobalStats, MapError>;
+    fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError>;
     fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError>;
     fn get_global_enabled(&self) -> Result<bool, MapError>;
+    fn set_flow_keys_live(&self, flow_keys_live: bool) -> Result<(), MapError>;
+    fn get_flow_keys_live(&self) -> Result<bool, MapError>;
 }
 
 struct EbpfMapOps {
@@ -68,6 +83,51 @@ impl MapClient {
         self.inner.delete_policy(tenant)
     }
 
+    /// Reads an exact policy entry for a tenant key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
+    pub fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+        self.inner.get_policy(tenant)
+    }
+
+    /// Resolves the effective policy for a tenant using precedence rules.
+    ///
+    /// Precedence order:
+    /// 1. exact `(src_ip, proto, dst_port)`
+    /// 2. proto wildcard `(src_ip, proto, 0)`
+    /// 3. full wildcard `(src_ip, 0, 0)`
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when map access fails.
+    pub fn resolve_policy(&self, requested: TenantKey) -> Result<Option<ResolvedPolicy>, MapError> {
+        let (exact, proto_wildcard, full_wildcard) = fallback_policy_keys(requested);
+        let candidates = [Some(exact), proto_wildcard, full_wildcard];
+        let mut prior: Option<TenantKey> = None;
+
+        for candidate in candidates.into_iter().flatten() {
+            if prior == Some(candidate) {
+                continue;
+            }
+            prior = Some(candidate);
+
+            if let Some(policy) = self.get_policy(candidate)? {
+                let level =
+                    policy_match_level(requested, candidate).unwrap_or(PolicyMatchLevel::Exact);
+                return Ok(Some(ResolvedPolicy {
+                    requested,
+                    matched: candidate,
+                    match_level: level,
+                    policy,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Reads all tenant counters from `COUNTERS_MAP`.
     ///
     /// # Errors
@@ -84,6 +144,15 @@ impl MapClient {
     /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
     pub fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
         self.inner.read_global_stats()
+    }
+
+    /// Seeds `GLOBAL_CONFIG_MAP[0]` during daemon startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map write fails.
+    pub fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError> {
+        self.inner.seed_global_config(config)
     }
 
     /// Sets `GLOBAL_CONFIG_MAP[0].enabled` to toggle data-path filtering.
@@ -103,9 +172,58 @@ impl MapClient {
     pub fn get_global_enabled(&self) -> Result<bool, MapError> {
         self.inner.get_global_enabled()
     }
+
+    /// Sets `GLOBAL_CONFIG_MAP[0].flow_keys_live` to toggle flow-aware keying.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map write fails.
+    pub fn set_flow_keys_live(&self, flow_keys_live: bool) -> Result<(), MapError> {
+        self.inner.set_flow_keys_live(flow_keys_live)
+    }
+
+    /// Reads `GLOBAL_CONFIG_MAP[0].flow_keys_live`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
+    pub fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+        self.inner.get_flow_keys_live()
+    }
 }
 
 impl MapOps for EbpfMapOps {
+    fn set_flow_keys_live(&self, flow_keys_live: bool) -> Result<(), MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        {
+            let map = ebpf
+                .map_mut("GLOBAL_CONFIG_MAP")
+                .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
+            let mut global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
+            let mut config = read_global_config_or_default(&global_config_map)?;
+            config.flow_keys_live = u8::from(flow_keys_live);
+            global_config_map.set(GLOBAL_CONFIG_INDEX, config, 0)?;
+        }
+        drop(ebpf);
+
+        Ok(())
+    }
+
+    fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let flow_keys_live = {
+            let map = ebpf
+                .map_mut("GLOBAL_CONFIG_MAP")
+                .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
+            let global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
+            let config = read_global_config_or_default(&global_config_map)?;
+            config.flow_keys_live != 0
+        };
+        drop(ebpf);
+
+        Ok(flow_keys_live)
+    }
+
     fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
         let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
         {
@@ -136,6 +254,23 @@ impl MapOps for EbpfMapOps {
         remove_result?;
 
         Ok(())
+    }
+
+    fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let read_result = {
+            let map = ebpf
+                .map_mut("POLICY_MAP")
+                .ok_or(MapError::MissingMap("POLICY_MAP"))?;
+            let policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            match policy_map.get(&tenant, 0) {
+                Ok(policy) => Ok(Some(policy)),
+                Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+                Err(error) => Err(MapError::Map(error)),
+            }
+        };
+        drop(ebpf);
+        read_result
     }
 
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
@@ -176,6 +311,20 @@ impl MapOps for EbpfMapOps {
         Ok(stats)
     }
 
+    fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        {
+            let map = ebpf
+                .map_mut("GLOBAL_CONFIG_MAP")
+                .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
+            let mut global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
+            global_config_map.set(GLOBAL_CONFIG_INDEX, config, 0)?;
+        }
+        drop(ebpf);
+
+        Ok(())
+    }
+
     fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
         let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
         {
@@ -183,10 +332,8 @@ impl MapOps for EbpfMapOps {
                 .map_mut("GLOBAL_CONFIG_MAP")
                 .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
             let mut global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
-            let config = GlobalConfig {
-                enabled: u8::from(enabled),
-                _pad: [0; 7],
-            };
+            let mut config = read_global_config_or_default(&global_config_map)?;
+            config.enabled = u8::from(enabled);
             global_config_map.set(GLOBAL_CONFIG_INDEX, config, 0)?;
         }
         drop(ebpf);
@@ -201,12 +348,26 @@ impl MapOps for EbpfMapOps {
                 .map_mut("GLOBAL_CONFIG_MAP")
                 .ok_or(MapError::MissingMap("GLOBAL_CONFIG_MAP"))?;
             let global_config_map = Array::<_, GlobalConfig>::try_from(map)?;
-            let config = global_config_map.get(&GLOBAL_CONFIG_INDEX, 0)?;
+            let config = read_global_config_or_default(&global_config_map)?;
             config.enabled != 0
         };
         drop(ebpf);
 
         Ok(enabled)
+    }
+}
+
+fn read_global_config_or_default(
+    global_config_map: &Array<&mut aya::maps::MapData, GlobalConfig>,
+) -> Result<GlobalConfig, MapError> {
+    match global_config_map.get(&GLOBAL_CONFIG_INDEX, 0) {
+        Ok(config) => Ok(config),
+        Err(aya::maps::MapError::KeyNotFound) => Ok(GlobalConfig {
+            enabled: 1,
+            flow_keys_live: 1,
+            _pad: [0; 6],
+        }),
+        Err(error) => Err(MapError::Map(error)),
     }
 }
 
@@ -217,7 +378,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use vantage_common::ReasonBuckets;
+    use vantage_common::{PolicyMatchLevel, ReasonBuckets};
 
     use super::*;
 
@@ -225,7 +386,7 @@ mod tests {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
         counters: Vec<(TenantKey, Counters)>,
         global_stats: GlobalStats,
-        global_enabled: Mutex<bool>,
+        global_config: Mutex<GlobalConfig>,
     }
 
     impl FixtureMapOps {
@@ -234,7 +395,11 @@ mod tests {
                 policies: Mutex::new(BTreeMap::new()),
                 counters,
                 global_stats,
-                global_enabled: Mutex::new(false),
+                global_config: Mutex::new(GlobalConfig {
+                    enabled: 0,
+                    flow_keys_live: 1,
+                    _pad: [0; 6],
+                }),
             })
         }
     }
@@ -256,6 +421,16 @@ mod tests {
             Ok(())
         }
 
+        fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            let policy = self
+                .policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .get(&tenant)
+                .copied();
+            Ok(policy)
+        }
+
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
             Ok(self.counters.clone())
         }
@@ -264,23 +439,53 @@ mod tests {
             Ok(self.global_stats)
         }
 
+        fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError> {
+            {
+                let mut current = self
+                    .global_config
+                    .lock()
+                    .map_err(|_| MapError::LockPoisoned)?;
+                *current = config;
+            }
+            Ok(())
+        }
+
         fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
             {
                 let mut current = self
-                    .global_enabled
+                    .global_config
                     .lock()
                     .map_err(|_| MapError::LockPoisoned)?;
-                *current = enabled;
+                current.enabled = u8::from(enabled);
             }
             Ok(())
         }
 
         fn get_global_enabled(&self) -> Result<bool, MapError> {
             let current = self
-                .global_enabled
+                .global_config
                 .lock()
                 .map_err(|_| MapError::LockPoisoned)?;
-            Ok(*current)
+            Ok(current.enabled != 0)
+        }
+
+        fn set_flow_keys_live(&self, flow_keys_live: bool) -> Result<(), MapError> {
+            {
+                let mut current = self
+                    .global_config
+                    .lock()
+                    .map_err(|_| MapError::LockPoisoned)?;
+                current.flow_keys_live = u8::from(flow_keys_live);
+            }
+            Ok(())
+        }
+
+        fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+            let current = self
+                .global_config
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?;
+            Ok(current.flow_keys_live != 0)
         }
     }
 
@@ -406,5 +611,135 @@ mod tests {
             panic!("global enabled should be readable after write");
         };
         assert!(enabled);
+    }
+
+    #[test]
+    fn flow_keys_live_round_trip_uses_fixture_storage() {
+        let maps = MapClient::from_ops(FixtureMapOps::with_data(Vec::new(), sample_global_stats()));
+
+        let initially_live = maps.get_flow_keys_live();
+        let Ok(initially_live) = initially_live else {
+            panic!("flow-keys mode should be readable");
+        };
+        assert!(initially_live);
+
+        let set = maps.set_flow_keys_live(false);
+        assert!(set.is_ok(), "flow-keys mode should be writable");
+
+        let live = maps.get_flow_keys_live();
+        let Ok(live) = live else {
+            panic!("flow-keys mode should be readable after write");
+        };
+        assert!(!live);
+    }
+
+    #[test]
+    fn seed_global_config_overwrites_fixture_storage() {
+        let maps = MapClient::from_ops(FixtureMapOps::with_data(Vec::new(), sample_global_stats()));
+        let set = maps.seed_global_config(GlobalConfig {
+            enabled: 1,
+            flow_keys_live: 0,
+            _pad: [0; 6],
+        });
+        assert!(set.is_ok(), "global config seed should be writable");
+
+        let enabled = maps.get_global_enabled();
+        let Ok(enabled) = enabled else {
+            panic!("global enabled should be readable");
+        };
+        assert!(enabled);
+
+        let flow_keys_live = maps.get_flow_keys_live();
+        let Ok(flow_keys_live) = flow_keys_live else {
+            panic!("flow-keys mode should be readable");
+        };
+        assert!(!flow_keys_live);
+    }
+
+    #[test]
+    fn resolve_policy_uses_exact_then_proto_then_full_wildcard() {
+        let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let exact_key = TenantKey {
+            src_ip: 0x0a01_0203,
+            proto: 6,
+            dst_port: 443,
+            _pad: 0,
+        };
+        let proto_wildcard_key = TenantKey {
+            src_ip: exact_key.src_ip,
+            proto: exact_key.proto,
+            dst_port: 0,
+            _pad: 0,
+        };
+        let full_wildcard_key = TenantKey {
+            src_ip: exact_key.src_ip,
+            proto: 0,
+            dst_port: 0,
+            _pad: 0,
+        };
+
+        let upsert_full = maps.upsert_policy(
+            full_wildcard_key,
+            Policy {
+                rate_tokens_per_sec: 100,
+                burst_tokens: 10,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(upsert_full.is_ok(), "full wildcard insert should succeed");
+
+        let resolved_full = maps.resolve_policy(exact_key);
+        let Ok(resolved_full) = resolved_full else {
+            panic!("policy resolution should succeed");
+        };
+        let Some(resolved_full) = resolved_full else {
+            panic!("full wildcard fallback should resolve");
+        };
+        assert_eq!(resolved_full.matched, full_wildcard_key);
+        assert_eq!(resolved_full.match_level, PolicyMatchLevel::FullWildcard);
+
+        let upsert_proto = maps.upsert_policy(
+            proto_wildcard_key,
+            Policy {
+                rate_tokens_per_sec: 200,
+                burst_tokens: 20,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(upsert_proto.is_ok(), "proto wildcard insert should succeed");
+
+        let resolved_proto = maps.resolve_policy(exact_key);
+        let Ok(resolved_proto) = resolved_proto else {
+            panic!("policy resolution should succeed");
+        };
+        let Some(resolved_proto) = resolved_proto else {
+            panic!("proto wildcard fallback should resolve");
+        };
+        assert_eq!(resolved_proto.matched, proto_wildcard_key);
+        assert_eq!(resolved_proto.match_level, PolicyMatchLevel::ProtoWildcard);
+
+        let upsert_exact = maps.upsert_policy(
+            exact_key,
+            Policy {
+                rate_tokens_per_sec: 300,
+                burst_tokens: 30,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(upsert_exact.is_ok(), "exact insert should succeed");
+
+        let resolved_exact = maps.resolve_policy(exact_key);
+        let Ok(resolved_exact) = resolved_exact else {
+            panic!("policy resolution should succeed");
+        };
+        let Some(resolved_exact) = resolved_exact else {
+            panic!("exact match should resolve");
+        };
+        assert_eq!(resolved_exact.matched, exact_key);
+        assert_eq!(resolved_exact.match_level, PolicyMatchLevel::Exact);
     }
 }

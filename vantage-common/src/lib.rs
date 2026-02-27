@@ -3,7 +3,9 @@
 #[cfg(feature = "user")]
 use aya::Pod;
 
-/// Flow-aware identity key derived from packet metadata.
+/// Flow-aware identity key derived from L2/L3/L4 packet metadata only.
+///
+/// No application payload fields are part of kernel-side key extraction.
 /// `dst_port` and `proto` support wildcard semantics for fallback matching.
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
@@ -14,6 +16,67 @@ pub struct TenantKey {
     pub dst_port: u16, // 0 => wildcard
     pub proto: u8,     // 0 => wildcard, 6 => TCP, 17 => UDP
     pub _pad: u8,
+}
+
+#[repr(u8)]
+#[cfg_attr(feature = "user", derive(serde::Serialize))]
+#[cfg_attr(feature = "user", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyMatchLevel {
+    Exact = 0,
+    ProtoWildcard = 1,
+    FullWildcard = 2,
+}
+
+#[must_use]
+pub const fn fallback_policy_keys(
+    key: TenantKey,
+) -> (TenantKey, Option<TenantKey>, Option<TenantKey>) {
+    let exact_key = key;
+    let proto_wildcard_key = if key.dst_port != 0 {
+        Some(TenantKey {
+            src_ip: key.src_ip,
+            dst_port: 0,
+            proto: key.proto,
+            _pad: 0,
+        })
+    } else {
+        None
+    };
+    let full_wildcard_key = if key.proto != 0 || key.dst_port != 0 {
+        Some(TenantKey {
+            src_ip: key.src_ip,
+            dst_port: 0,
+            proto: 0,
+            _pad: 0,
+        })
+    } else {
+        None
+    };
+
+    (exact_key, proto_wildcard_key, full_wildcard_key)
+}
+
+#[must_use]
+pub fn policy_match_level(requested: TenantKey, matched: TenantKey) -> Option<PolicyMatchLevel> {
+    let (exact_key, proto_wildcard_key, full_wildcard_key) = fallback_policy_keys(requested);
+    if matched == exact_key {
+        return Some(PolicyMatchLevel::Exact);
+    }
+
+    if let Some(proto_wildcard) = proto_wildcard_key
+        && matched == proto_wildcard
+    {
+        return Some(PolicyMatchLevel::ProtoWildcard);
+    }
+
+    if let Some(full_wildcard) = full_wildcard_key
+        && matched == full_wildcard
+    {
+        return Some(PolicyMatchLevel::FullWildcard);
+    }
+
+    None
 }
 
 /// Kernel drop-event emission sampling ratio (`1/N`) used in eBPF.
@@ -113,8 +176,9 @@ pub struct LockedGlobalStats {
 #[allow(clippy::pub_underscore_fields)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlobalConfig {
-    pub enabled: u8, // 0 => bypass data path logic (fail-open)
-    pub _pad: [u8; 7],
+    pub enabled: u8,        // 0 => bypass data path logic (fail-open)
+    pub flow_keys_live: u8, // 0 => legacy src-ip-only matching, 1 => flow-aware key matching
+    pub _pad: [u8; 6],
 }
 
 #[repr(u8)]
@@ -142,6 +206,13 @@ pub struct DropEvent {
     pub reason: u8,
     pub _pad: [u8; 7],
 }
+
+/// Byte offset of `DropEvent::ts_ns` within `DropEvent`.
+pub const DROP_EVENT_TS_NS_OFFSET: usize = core::mem::offset_of!(DropEvent, ts_ns);
+/// Byte offset of `DropEvent::tenant_key` within `DropEvent`.
+pub const DROP_EVENT_TENANT_KEY_OFFSET: usize = core::mem::offset_of!(DropEvent, tenant_key);
+/// Byte offset of `DropEvent::reason` within `DropEvent`.
+pub const DROP_EVENT_REASON_OFFSET: usize = core::mem::offset_of!(DropEvent, reason);
 
 #[cfg(feature = "user")]
 // SAFETY: `TenantKey` is `repr(C)` and contains only plain integer fields.

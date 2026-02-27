@@ -11,6 +11,7 @@ use vantage_common::{Counters, TenantKey};
 use crate::{
     MetricsState,
     map_client::{MapClient, MapError},
+    tenant::{normalized_flow_key, proto_label, src_ip_label},
 };
 
 #[derive(Debug, Error)]
@@ -42,9 +43,9 @@ pub(crate) struct CpuWindowSample {
 /// # Errors
 ///
 /// Returns `MetricsError` when map reads fail.
-pub(crate) fn render_metrics(maps: &MapClient) -> Result<String, MetricsError> {
+pub(crate) fn render_metrics(maps: &MapClient, dimensional: bool) -> Result<String, MetricsError> {
     let counters = maps.collect_counters()?;
-    Ok(append_counter_metrics(&counters))
+    Ok(append_counter_metrics(&counters, dimensional))
 }
 
 /// Builds Prometheus text output from daemon and tenant counters.
@@ -55,6 +56,7 @@ pub(crate) fn render_metrics(maps: &MapClient) -> Result<String, MetricsError> {
 pub(crate) fn render_metrics_payload(
     metrics: &MetricsState,
     maps: &MapClient,
+    dimensional: bool,
 ) -> Result<Vec<u8>, MetricsError> {
     metrics.daemon_up.set(1);
 
@@ -62,7 +64,7 @@ pub(crate) fn render_metrics_payload(
     let mut payload = Vec::new();
     TextEncoder::new().encode(&metric_families, &mut payload)?;
 
-    let counters = render_metrics(maps)?;
+    let counters = render_metrics(maps, dimensional)?;
     payload.extend_from_slice(counters.as_bytes());
 
     Ok(payload)
@@ -241,39 +243,84 @@ fn parse_daemon_jiffies(text: &str) -> Result<u64, MetricsError> {
     Ok(utime.saturating_add(stime))
 }
 
-fn append_counter_metrics(counters: &[(TenantKey, Counters)]) -> String {
+fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool) -> String {
     let mut payload = String::new();
-    payload.push_str("# HELP vantage_tenant_pass_packets Total packets allowed for tenant.\n");
+    payload.push_str("# HELP vantage_tenant_pass_packets Total packets allowed by policy.\n");
     payload.push_str("# TYPE vantage_tenant_pass_packets counter\n");
-    payload.push_str("# HELP vantage_tenant_drop_packets Total packets dropped for tenant.\n");
+    payload.push_str("# HELP vantage_tenant_drop_packets Total packets dropped by policy.\n");
     payload.push_str("# TYPE vantage_tenant_drop_packets counter\n");
-    payload.push_str("# HELP vantage_tenant_pass_bytes Total bytes allowed for tenant.\n");
+    payload.push_str("# HELP vantage_tenant_pass_bytes Total bytes allowed by policy.\n");
     payload.push_str("# TYPE vantage_tenant_pass_bytes counter\n");
-    payload.push_str("# HELP vantage_tenant_drop_bytes Total bytes dropped for tenant.\n");
+    payload.push_str("# HELP vantage_tenant_drop_bytes Total bytes dropped by policy.\n");
     payload.push_str("# TYPE vantage_tenant_drop_bytes counter\n");
 
-    for (tenant, counters) in counters {
-        let _ = writeln!(
-            payload,
-            "vantage_tenant_pass_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
-            tenant.src_ip, tenant.dst_port, tenant.proto, counters.pass_pkts
-        );
-        let _ = writeln!(
-            payload,
-            "vantage_tenant_drop_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
-            tenant.src_ip, tenant.dst_port, tenant.proto, counters.drop_pkts
-        );
-        let _ = writeln!(
-            payload,
-            "vantage_tenant_pass_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
-            tenant.src_ip, tenant.dst_port, tenant.proto, counters.pass_bytes
-        );
-        let _ = writeln!(
-            payload,
-            "vantage_tenant_drop_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\"}} {}",
-            tenant.src_ip, tenant.dst_port, tenant.proto, counters.drop_bytes
-        );
+    if dimensional {
+        for (tenant, counters) in counters {
+            let flow_key = normalized_flow_key(*tenant);
+            let dst_port = if tenant.dst_port == 0 {
+                "*".to_owned()
+            } else {
+                tenant.dst_port.to_string()
+            };
+            let _ = writeln!(
+                payload,
+                "vantage_tenant_pass_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                src_ip_label(tenant.src_ip),
+                dst_port,
+                proto_label(tenant.proto),
+                flow_key,
+                counters.pass_pkts
+            );
+            let _ = writeln!(
+                payload,
+                "vantage_tenant_drop_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                src_ip_label(tenant.src_ip),
+                dst_port,
+                proto_label(tenant.proto),
+                flow_key,
+                counters.drop_pkts
+            );
+            let _ = writeln!(
+                payload,
+                "vantage_tenant_pass_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                src_ip_label(tenant.src_ip),
+                dst_port,
+                proto_label(tenant.proto),
+                flow_key,
+                counters.pass_bytes
+            );
+            let _ = writeln!(
+                payload,
+                "vantage_tenant_drop_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                src_ip_label(tenant.src_ip),
+                dst_port,
+                proto_label(tenant.proto),
+                flow_key,
+                counters.drop_bytes
+            );
+        }
+        return payload;
     }
+
+    let totals = counters.iter().fold(
+        Counters {
+            pass_pkts: 0,
+            drop_pkts: 0,
+            pass_bytes: 0,
+            drop_bytes: 0,
+        },
+        |mut acc, (_, current)| {
+            acc.pass_pkts = acc.pass_pkts.saturating_add(current.pass_pkts);
+            acc.drop_pkts = acc.drop_pkts.saturating_add(current.drop_pkts);
+            acc.pass_bytes = acc.pass_bytes.saturating_add(current.pass_bytes);
+            acc.drop_bytes = acc.drop_bytes.saturating_add(current.drop_bytes);
+            acc
+        },
+    );
+    let _ = writeln!(payload, "vantage_tenant_pass_packets {}", totals.pass_pkts);
+    let _ = writeln!(payload, "vantage_tenant_drop_packets {}", totals.drop_pkts);
+    let _ = writeln!(payload, "vantage_tenant_pass_bytes {}", totals.pass_bytes);
+    let _ = writeln!(payload, "vantage_tenant_drop_bytes {}", totals.drop_bytes);
 
     payload
 }
@@ -295,44 +342,65 @@ mod tests {
     }
 
     #[test]
-    fn tenant_metrics_use_real_newlines() {
-        let payload = append_counter_metrics(&[(
-            TenantKey {
-                src_ip: 42,
-                dst_port: 0,
-                proto: 0,
-                _pad: 0,
-            },
-            Counters {
-                pass_pkts: 1,
-                drop_pkts: 2,
-                pass_bytes: 3,
-                drop_bytes: 4,
-            },
-        )]);
+    fn dimensional_tenant_metrics_emit_flow_labels() {
+        let payload = append_counter_metrics(
+            &[(
+                TenantKey {
+                    src_ip: 167_838_211,
+                    dst_port: 0,
+                    proto: 0,
+                    _pad: 0,
+                },
+                Counters {
+                    pass_pkts: 1,
+                    drop_pkts: 2,
+                    pass_bytes: 3,
+                    drop_bytes: 4,
+                },
+            )],
+            true,
+        );
 
         let text = payload;
         assert!(
             text.contains(
-                "vantage_tenant_pass_packets{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 1\n"
+                "vantage_tenant_pass_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*\"} 1\n"
             )
         );
         assert!(
             text.contains(
-                "vantage_tenant_drop_packets{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 2\n"
-            )
-        );
-        assert!(
-            text.contains(
-                "vantage_tenant_pass_bytes{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 3\n"
-            )
-        );
-        assert!(
-            text.contains(
-                "vantage_tenant_drop_bytes{src_ip=\"42\",dst_port=\"0\",proto=\"0\"} 4\n"
+                "vantage_tenant_drop_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*\"} 2\n"
             )
         );
         assert!(!text.contains("\\n"));
+    }
+
+    #[test]
+    fn aggregated_metrics_disable_flow_dimensions() {
+        let payload = append_counter_metrics(
+            &[(
+                TenantKey {
+                    src_ip: 42,
+                    dst_port: 53,
+                    proto: 17,
+                    _pad: 0,
+                },
+                Counters {
+                    pass_pkts: 1,
+                    drop_pkts: 2,
+                    pass_bytes: 3,
+                    drop_bytes: 4,
+                },
+            )],
+            false,
+        );
+
+        let text = payload;
+        assert!(text.contains("vantage_tenant_pass_packets 1\n"));
+        assert!(text.contains("vantage_tenant_drop_packets 2\n"));
+        assert!(text.contains("vantage_tenant_pass_bytes 3\n"));
+        assert!(text.contains("vantage_tenant_drop_bytes 4\n"));
+        assert!(!text.contains("{src_ip="));
 
         let mut parsed_samples = 0_u32;
         for line in text.lines() {
@@ -355,6 +423,48 @@ mod tests {
             }
         }
         assert_eq!(parsed_samples, 4);
+    }
+
+    #[test]
+    fn aggregated_metrics_sum_multiple_tenants() {
+        let payload = append_counter_metrics(
+            &[
+                (
+                    TenantKey {
+                        src_ip: 1,
+                        dst_port: 80,
+                        proto: 6,
+                        _pad: 0,
+                    },
+                    Counters {
+                        pass_pkts: 10,
+                        drop_pkts: 2,
+                        pass_bytes: 1_000,
+                        drop_bytes: 200,
+                    },
+                ),
+                (
+                    TenantKey {
+                        src_ip: 2,
+                        dst_port: 53,
+                        proto: 17,
+                        _pad: 0,
+                    },
+                    Counters {
+                        pass_pkts: 3,
+                        drop_pkts: 4,
+                        pass_bytes: 300,
+                        drop_bytes: 400,
+                    },
+                ),
+            ],
+            false,
+        );
+
+        assert!(payload.contains("vantage_tenant_pass_packets 13\n"));
+        assert!(payload.contains("vantage_tenant_drop_packets 6\n"));
+        assert!(payload.contains("vantage_tenant_pass_bytes 1300\n"));
+        assert!(payload.contains("vantage_tenant_drop_bytes 600\n"));
     }
 
     #[test]

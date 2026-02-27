@@ -89,6 +89,34 @@ impl TenantRef {
     }
 }
 
+pub(crate) fn src_ip_label(src_ip: u32) -> String {
+    Ipv4Addr::from(src_ip).to_string()
+}
+
+pub(crate) const fn proto_label(proto: u8) -> &'static str {
+    match proto {
+        0 => "*",
+        6 => "tcp",
+        17 => "udp",
+        _ => "other",
+    }
+}
+
+pub(crate) fn normalized_flow_key(tenant: TenantKey) -> String {
+    let port = if tenant.dst_port == 0 {
+        "*".to_owned()
+    } else {
+        tenant.dst_port.to_string()
+    };
+
+    format!(
+        "src={}|proto={}|dport={}",
+        src_ip_label(tenant.src_ip),
+        proto_label(tenant.proto),
+        port
+    )
+}
+
 fn parse_ipv4(raw: &str) -> Result<TenantRef, TenantParseError> {
     let addr = Ipv4Addr::from_str(raw).map_err(|_| TenantParseError::Invalid)?;
     Ok(TenantRef {
@@ -114,7 +142,7 @@ pub(crate) enum TenantParseError {
 mod tests {
     use vantage_common::TenantKey;
 
-    use super::{FlowProto, TenantRef};
+    use super::{FlowProto, TenantRef, normalized_flow_key, proto_label, src_ip_label};
 
     #[test]
     fn parses_canonical_ip_prefix() {
@@ -228,5 +256,28 @@ mod tests {
             panic!("proto parsing should succeed");
         };
         assert_eq!(proto, FlowProto::Tcp);
+    }
+
+    #[test]
+    fn labels_proto_and_ip_for_observability() {
+        assert_eq!(src_ip_label(167_838_211), "10.1.2.3");
+        assert_eq!(proto_label(0), "*");
+        assert_eq!(proto_label(6), "tcp");
+        assert_eq!(proto_label(17), "udp");
+        assert_eq!(proto_label(99), "other");
+    }
+
+    #[test]
+    fn builds_normalized_flow_key() {
+        let tenant = TenantKey {
+            src_ip: 167_838_211,
+            dst_port: 443,
+            proto: 6,
+            _pad: 0,
+        };
+        assert_eq!(
+            normalized_flow_key(tenant),
+            "src=10.1.2.3|proto=tcp|dport=443"
+        );
     }
 }

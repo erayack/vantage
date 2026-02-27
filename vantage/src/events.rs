@@ -10,12 +10,14 @@ use tokio::{
     sync::watch,
 };
 use tracing::{info, warn};
-use vantage_common::{DropEvent, DropReason, TenantKey};
+use vantage_common::{
+    DROP_EVENT_REASON_OFFSET, DROP_EVENT_TENANT_KEY_OFFSET, DROP_EVENT_TS_NS_OFFSET, DropEvent,
+    DropReason, TenantKey,
+};
+
+use crate::tenant::{normalized_flow_key, proto_label, src_ip_label};
 
 const DROP_EVENTS_MAP: &str = "DROP_EVENTS";
-const TS_NS_OFFSET: usize = 0;
-const TENANT_KEY_OFFSET: usize = 8;
-const REASON_OFFSET: usize = 16;
 const MAX_EVENTS_PER_WAKE: usize = 1024;
 
 pub(crate) type RingBufferHandle = RingBuf<MapData>;
@@ -81,8 +83,13 @@ pub(crate) async fn run_drop_event_consumer(
                         if let Some(event) = decode_drop_event(&item) {
                             seen_events = seen_events.saturating_add(1);
                             if seen_events.is_multiple_of(u64::from(log_sample_n)) {
+                                let flow_key = normalized_flow_key(event.tenant);
                                 info!(
                                     tenant = ?event.tenant,
+                                    flow_key = %flow_key,
+                                    src_ip = %src_ip_label(event.tenant.src_ip),
+                                    proto = proto_label(event.tenant.proto),
+                                    dst_port = event.tenant.dst_port,
                                     reason = event.reason,
                                     ts_ns = event.ts_ns,
                                     log_sample_n,
@@ -139,18 +146,22 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
     }
 
     let src_ip = u32::from_ne_bytes(
-        payload[TENANT_KEY_OFFSET..TENANT_KEY_OFFSET + 4]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 4]
             .try_into()
             .ok()?,
     );
     let dst_port = u16::from_ne_bytes(
-        payload[TENANT_KEY_OFFSET + 4..TENANT_KEY_OFFSET + 6]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 6]
             .try_into()
             .ok()?,
     );
-    let proto = *payload.get(TENANT_KEY_OFFSET + 6)?;
-    let ts_ns = u64::from_ne_bytes(payload[TS_NS_OFFSET..TS_NS_OFFSET + 8].try_into().ok()?);
-    let reason_code = *payload.get(REASON_OFFSET)?;
+    let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 6)?;
+    let ts_ns = u64::from_ne_bytes(
+        payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
+            .try_into()
+            .ok()?,
+    );
+    let reason_code = *payload.get(DROP_EVENT_REASON_OFFSET)?;
 
     Some(DecodedDropEvent {
         tenant: TenantKey {
@@ -183,12 +194,12 @@ mod tests {
     use std::{mem::size_of, time::Duration};
 
     use tokio::sync::watch;
-    use vantage_common::{DropEvent, DropReason, TenantKey};
-
-    use super::{
-        REASON_OFFSET, TENANT_KEY_OFFSET, TS_NS_OFFSET, decode_drop_event,
-        should_stop_after_shutdown_change,
+    use vantage_common::{
+        DROP_EVENT_REASON_OFFSET, DROP_EVENT_TENANT_KEY_OFFSET, DROP_EVENT_TS_NS_OFFSET, DropEvent,
+        DropReason, TenantKey,
     };
+
+    use super::{decode_drop_event, should_stop_after_shutdown_change};
 
     #[tokio::test]
     async fn shutdown_channel_stays_open_while_sender_is_retained() {
@@ -229,13 +240,14 @@ mod tests {
             _pad: [0; 7],
         };
         let mut payload = [0_u8; size_of::<DropEvent>()];
-        payload[TS_NS_OFFSET..TS_NS_OFFSET + 8].copy_from_slice(&event.ts_ns.to_ne_bytes());
-        payload[TENANT_KEY_OFFSET..TENANT_KEY_OFFSET + 4]
+        payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
+            .copy_from_slice(&event.ts_ns.to_ne_bytes());
+        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 4]
             .copy_from_slice(&event.tenant_key.src_ip.to_ne_bytes());
-        payload[TENANT_KEY_OFFSET + 4..TENANT_KEY_OFFSET + 6]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 6]
             .copy_from_slice(&event.tenant_key.dst_port.to_ne_bytes());
-        payload[TENANT_KEY_OFFSET + 6] = event.tenant_key.proto;
-        payload[REASON_OFFSET] = event.reason;
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 6] = event.tenant_key.proto;
+        payload[DROP_EVENT_REASON_OFFSET] = event.reason;
 
         let decoded = decode_drop_event(&payload);
         let Some(decoded) = decoded else {
@@ -250,8 +262,11 @@ mod tests {
     #[test]
     fn drop_event_offsets_match_shared_contract() {
         assert_eq!(size_of::<DropEvent>(), 24);
-        assert_eq!(TS_NS_OFFSET, 0);
-        assert_eq!(TENANT_KEY_OFFSET, 8);
-        assert_eq!(REASON_OFFSET, 16);
+        assert_eq!(DROP_EVENT_TS_NS_OFFSET, 0);
+        assert_eq!(DROP_EVENT_TENANT_KEY_OFFSET, 8);
+        assert_eq!(
+            DROP_EVENT_REASON_OFFSET,
+            DROP_EVENT_TENANT_KEY_OFFSET + size_of::<TenantKey>()
+        );
     }
 }

@@ -34,13 +34,17 @@ The eBPF object is compiled and embedded automatically by the build script.
 | `--drop-event-sample-n` | `VANTAGE_DROP_EVENT_SAMPLE_N` | `1` | Sample 1-in-N drop events to ring buffer |
 | `--drop-event-log-enabled` | `VANTAGE_DROP_EVENT_LOG_ENABLED` | `false` | Enable drop event consumer |
 | `--cpu-window-ms` | `VANTAGE_CPU_WINDOW_MS` | `5000` | CPU sampling window for `/debug/snapshot` |
+| `--metrics-dimensional-enabled` | `VANTAGE_METRICS_DIMENSIONAL_ENABLED` | `false` | Emit per-flow labels in `/metrics` (aggregate-only when disabled) |
+| `--flow-keys-mode` | `VANTAGE_FLOW_KEYS_MODE` | `live` | `live` uses `(src_ip, proto, dst_port)` keys; `legacy` uses `(src_ip, 0, 0)` |
+| `--debug-top-tenants` | `VANTAGE_DEBUG_TOP_TENANTS` | `10` | Max number of top drop tenants returned by `/debug/snapshot` |
 
 ## API
 
 ```
-PUT    /policy/{tenant_ip_u32}   # upsert rate-limit policy
-DELETE /policy/{tenant_ip_u32}   # remove policy (fail-open)
-GET    /metrics                  # Prometheus counters (per-tenant)
+PUT    /policy/{tenant}          # upsert rate-limit policy and return precedence metadata
+DELETE /policy/{tenant}          # remove policy and return effective fallback after delete
+GET    /policy/{tenant}/resolve  # resolve effective policy using precedence chain
+GET    /metrics                  # Prometheus counters (aggregate by default; per-flow when enabled)
 GET    /debug/snapshot           # benchmark snapshot: global stats + CPU sample
 ```
 
@@ -49,6 +53,16 @@ GET    /debug/snapshot           # benchmark snapshot: global stats + CPU sample
 ```json
 { "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true }
 ```
+
+`PUT /policy` also accepts optional flow selectors:
+
+```json
+{ "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true, "proto": "tcp", "dst_port": 443 }
+```
+
+Policy precedence is explicit and enforced consistently across API and kernel data-path:
+
+`exact(src_ip, proto, dst_port) > proto_wildcard(src_ip, proto, 0) > full_wildcard(src_ip, 0, 0)`
 
 ## Quality Gate
 

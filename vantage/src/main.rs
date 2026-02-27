@@ -31,7 +31,7 @@ use crate::{
     config::Config,
     control_api::{
         debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled, metrics,
-        put_admin_enabled, put_policy,
+        put_admin_enabled, put_policy, resolve_policy,
     },
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
@@ -64,6 +64,9 @@ struct HealthResponse {
     iface: String,
     direction: &'static str,
     cpu_window_ms: u64,
+    metrics_dimensional_enabled: bool,
+    flow_keys_live: bool,
+    debug_top_tenants: usize,
     drop_events: DropEventRuntime,
 }
 
@@ -117,8 +120,8 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         log_enabled: config.drop_event_log_enabled,
     };
     let maps = MapClient::new(Arc::new(std::sync::Mutex::new(ebpf)));
-    maps.set_global_enabled(true)
-        .context("failed to initialize GLOBAL_CONFIG_MAP enabled state")?;
+    maps.seed_global_config(config.global_config_seed().as_global_config())
+        .context("failed to seed GLOBAL_CONFIG_MAP startup state")?;
     let state = AppState {
         config: config.clone(),
         drop_events,
@@ -129,6 +132,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+        .route("/policy/:tenant/resolve", get(resolve_policy))
         .route(
             "/admin/enabled",
             put(put_admin_enabled).get(get_admin_enabled),
@@ -148,6 +152,9 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         cpu_window_ms = config.cpu_window_ms,
         drop_event_log_enabled = config.drop_event_log_enabled,
         drop_event_log_sample_n = config.drop_event_log_sample_n,
+        metrics_dimensional_enabled = config.metrics_dimensions.enabled(),
+        flow_keys_live = config.flow_keys_mode.live(),
+        debug_top_tenants = config.debug_top_tenants,
         kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
         "vantage daemon started"
     );
@@ -245,6 +252,9 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
         iface: state.config.iface.clone(),
         direction: direction_name(&state.config),
         cpu_window_ms: state.config.cpu_window_ms,
+        metrics_dimensional_enabled: state.config.metrics_dimensions.enabled(),
+        flow_keys_live: state.config.flow_keys_mode.live(),
+        debug_top_tenants: state.config.debug_top_tenants,
         drop_events: state.drop_events,
     })
 }
@@ -272,7 +282,8 @@ mod tests {
     };
     use prometheus::{IntGauge, Registry};
     use vantage_common::{
-        Counters, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets, TenantKey,
+        Counters, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets,
+        TenantKey,
     };
 
     use super::{AppState, DropEventRuntime, MetricsState, direction_name, healthz};
@@ -290,6 +301,10 @@ mod tests {
 
         fn delete_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
             Ok(())
+        }
+
+        fn get_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            Ok(None)
         }
 
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
@@ -310,11 +325,23 @@ mod tests {
             })
         }
 
+        fn seed_global_config(&self, _config: GlobalConfig) -> Result<(), MapError> {
+            Ok(())
+        }
+
         fn set_global_enabled(&self, _enabled: bool) -> Result<(), MapError> {
             Ok(())
         }
 
         fn get_global_enabled(&self) -> Result<bool, MapError> {
+            Ok(true)
+        }
+
+        fn set_flow_keys_live(&self, _flow_keys_live: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_flow_keys_live(&self) -> Result<bool, MapError> {
             Ok(true)
         }
     }
@@ -350,6 +377,9 @@ mod tests {
             drop_event_log_sample_n: 5,
             drop_event_log_enabled: true,
             cpu_window_ms: 5_000,
+            metrics_dimensions: crate::config::MetricsDimensions::Aggregate,
+            flow_keys_mode: crate::config::FlowKeysMode::Live,
+            debug_top_tenants: 10,
         };
         assert_eq!(direction_name(&config), "both");
     }
@@ -364,6 +394,9 @@ mod tests {
             drop_event_log_sample_n: 5,
             drop_event_log_enabled: true,
             cpu_window_ms: 2_500,
+            metrics_dimensions: crate::config::MetricsDimensions::PerFlow,
+            flow_keys_mode: crate::config::FlowKeysMode::Legacy,
+            debug_top_tenants: 25,
         };
         let state = test_state(
             config,
@@ -382,6 +415,9 @@ mod tests {
             KERNEL_DROP_EVENT_SAMPLE_EVERY
         );
         assert_eq!(json.cpu_window_ms, 2_500);
+        assert!(json.metrics_dimensional_enabled);
+        assert!(!json.flow_keys_live);
+        assert_eq!(json.debug_top_tenants, 25);
         assert_eq!(json.drop_events.log_sample_n, 5);
         assert!(json.drop_events.log_enabled);
     }

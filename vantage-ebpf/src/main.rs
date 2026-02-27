@@ -7,15 +7,16 @@ use aya_ebpf::{
     },
     helpers::{bpf_ktime_get_ns, bpf_spin_lock as bpf_helper_spin_lock, bpf_spin_unlock},
     macros::{classifier, map},
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::TcContext,
 };
 use vantage_common::{
     Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY,
-    LockedTokenState, Policy, TenantKey, TokenState,
+    LockedTokenState, Policy, TenantKey, TokenState, fallback_policy_keys,
 };
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
+const STATE_MAP_MAX_ENTRIES: u32 = 4096;
 const GLOBAL_STATS_MAX_ENTRIES: u32 = 1;
 const GLOBAL_STATS_INDEX: u32 = 0;
 const GLOBAL_CONFIG_MAX_ENTRIES: u32 = 1;
@@ -23,12 +24,13 @@ const GLOBAL_CONFIG_INDEX: u32 = 0;
 const DROP_EVENTS_BYTES: u32 = 1 << 17;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHER_TYPE_OFFSET: usize = 12;
+const ETHER_TYPE_IPV4: u16 = 0x0800;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_VERSION: u8 = 4;
-const IPV4_VERSION_IHL_OFFSET: usize = ETHERNET_HEADER_LEN;
-const IPV4_PROTOCOL_OFFSET: usize = ETHERNET_HEADER_LEN + 9;
-const IPV4_SRC_ADDR_OFFSET: usize = ETHERNET_HEADER_LEN + 12;
-const L4_DST_PORT_OFFSET: usize = 2;
+const IPV4_VERSION_IHL_REL_OFFSET: usize = 0;
+const IPV4_PROTOCOL_REL_OFFSET: usize = 9;
+const IPV4_SRC_ADDR_REL_OFFSET: usize = 12;
+const L4_DST_PORT_REL_OFFSET: usize = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -40,9 +42,9 @@ static POLICY_MAP: HashMap<TenantKey, Policy> =
 
 #[map]
 #[allow(dead_code)]
-static STATE_MAP: HashMap<TenantKey, LockedTokenState> =
-    HashMap::<TenantKey, LockedTokenState>::with_max_entries(
-        HASH_MAP_MAX_ENTRIES,
+static STATE_MAP: LruHashMap<TenantKey, LockedTokenState> =
+    LruHashMap::<TenantKey, LockedTokenState>::with_max_entries(
+        STATE_MAP_MAX_ENTRIES,
         NO_PREALLOC_MAP_FLAGS,
     );
 
@@ -81,7 +83,7 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
     let now_ns = monotonic_now_ns();
     let pkt_len = u64::from(ctx.len());
 
-    let Some(tenant_key) = flow_key_from_packet(ctx) else {
+    let Some(tenant_key) = flow_key_from_packet(ctx, is_flow_keys_live()) else {
         // Fail-open on parse failure.
         update_global_stats(pkt_len, true, Some(DropReason::ParseFail));
         return Ok(TC_ACT_OK);
@@ -126,19 +128,54 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
     }
 }
 
-fn flow_key_from_packet(ctx: &TcContext) -> Option<TenantKey> {
+fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantKey> {
     let packet_len = usize::try_from(ctx.len()).ok()?;
+    // Parser contract: keep kernel reads bounded to L2/L3/L4 headers only.
+    // Do not inspect application payload from this path.
+    let l3_offset = parse_l2_ipv4(ctx, packet_len)?;
+    let (proto, src_ip, l4_offset) = parse_l3_ipv4(ctx, packet_len, l3_offset)?;
+    if !flow_keys_live {
+        return Some(TenantKey {
+            src_ip,
+            dst_port: 0,
+            proto: 0,
+            _pad: 0,
+        });
+    }
+
+    let dst_port = parse_l4_dst_port(ctx, packet_len, proto, l4_offset)?;
+
+    Some(TenantKey {
+        src_ip,
+        dst_port,
+        proto,
+        _pad: 0,
+    })
+}
+
+fn parse_l2_ipv4(ctx: &TcContext, packet_len: usize) -> Option<usize> {
     if packet_len < ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN {
         return None;
     }
 
     let ether_type_hi = ctx.load::<u8>(ETHER_TYPE_OFFSET).ok()?;
     let ether_type_lo = ctx.load::<u8>(ETHER_TYPE_OFFSET + 1).ok()?;
-    if ether_type_hi != 0x08 || ether_type_lo != 0x00 {
+    let ether_type = u16::from_be_bytes([ether_type_hi, ether_type_lo]);
+    if ether_type != ETHER_TYPE_IPV4 {
         return None;
     }
 
-    let version_ihl = ctx.load::<u8>(IPV4_VERSION_IHL_OFFSET).ok()?;
+    Some(ETHERNET_HEADER_LEN)
+}
+
+fn parse_l3_ipv4(ctx: &TcContext, packet_len: usize, l3_offset: usize) -> Option<(u8, u32, usize)> {
+    if packet_len < l3_offset + IPV4_MIN_HEADER_LEN {
+        return None;
+    }
+
+    let version_ihl = ctx
+        .load::<u8>(l3_offset + IPV4_VERSION_IHL_REL_OFFSET)
+        .ok()?;
     if version_ihl >> 4 != IPV4_VERSION {
         return None;
     }
@@ -149,27 +186,14 @@ fn flow_key_from_packet(ctx: &TcContext) -> Option<TenantKey> {
     }
 
     let ip_header_len = usize::from(ihl_words) * 4;
-    if packet_len < ETHERNET_HEADER_LEN + ip_header_len {
+    if packet_len < l3_offset + ip_header_len {
         return None;
     }
 
-    let proto = ctx.load::<u8>(IPV4_PROTOCOL_OFFSET).ok()?;
-    let src_ip = ctx.load::<u32>(IPV4_SRC_ADDR_OFFSET).ok()?;
-
-    let l4_offset = ETHERNET_HEADER_LEN + ip_header_len;
-    let dst_port_be = if proto_has_dst_port(proto) {
-        Some(ctx.load::<u16>(l4_offset + L4_DST_PORT_OFFSET).ok()?)
-    } else {
-        None
-    };
-    let dst_port = parse_l4_dst_port(proto, packet_len, l4_offset, dst_port_be)?;
-
-    Some(TenantKey {
-        src_ip: u32::from_be(src_ip),
-        dst_port,
-        proto,
-        _pad: 0,
-    })
+    let proto = ctx.load::<u8>(l3_offset + IPV4_PROTOCOL_REL_OFFSET).ok()?;
+    let src_ip = ctx.load::<u32>(l3_offset + IPV4_SRC_ADDR_REL_OFFSET).ok()?;
+    let l4_offset = l3_offset + ip_header_len;
+    Some((proto, u32::from_be(src_ip), l4_offset))
 }
 
 fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> bool {
@@ -223,43 +247,23 @@ fn read_policy_with_fallback(key: TenantKey) -> Option<Policy> {
     None
 }
 
-fn fallback_policy_keys(key: TenantKey) -> (TenantKey, Option<TenantKey>, Option<TenantKey>) {
-    let exact_key = key;
-    let proto_wildcard_key = if key.dst_port != 0 {
-        Some(TenantKey {
-            src_ip: key.src_ip,
-            dst_port: 0,
-            proto: key.proto,
-            _pad: 0,
-        })
-    } else {
-        None
-    };
-    let full_wildcard_key = if key.proto != 0 || key.dst_port != 0 {
-        Some(TenantKey {
-            src_ip: key.src_ip,
-            dst_port: 0,
-            proto: 0,
-            _pad: 0,
-        })
-    } else {
-        None
-    };
-
-    (exact_key, proto_wildcard_key, full_wildcard_key)
+#[allow(unsafe_code)]
+fn is_filter_enabled() -> bool {
+    read_global_config().is_none_or(|config| config.enabled != 0)
 }
 
 #[allow(unsafe_code)]
-fn is_filter_enabled() -> bool {
-    if let Some(config_ptr) = GLOBAL_CONFIG_MAP.get_ptr(GLOBAL_CONFIG_INDEX) {
-        // SAFETY: Pointer originates from a BPF array lookup at a fixed index
-        // and is dereferenced only for a single field read in this invocation.
-        let config = unsafe { &*config_ptr };
-        return config.enabled != 0;
-    }
+fn is_flow_keys_live() -> bool {
+    read_global_config().is_none_or(|config| config.flow_keys_live != 0)
+}
 
-    // Fail-open when global config is missing or unreadable.
-    true
+#[allow(unsafe_code)]
+fn read_global_config() -> Option<GlobalConfig> {
+    let config_ptr = GLOBAL_CONFIG_MAP.get_ptr(GLOBAL_CONFIG_INDEX)?;
+    // SAFETY: Pointer originates from a BPF array lookup at a fixed index
+    // and is copied out immediately in this invocation.
+    let config = unsafe { *config_ptr };
+    Some(config)
 }
 
 fn initial_state(policy: &Policy, now_ns: u64) -> TokenState {
@@ -437,6 +441,20 @@ const fn proto_has_dst_port(proto: u8) -> bool {
 }
 
 fn parse_l4_dst_port(
+    ctx: &TcContext,
+    packet_len: usize,
+    proto: u8,
+    l4_offset: usize,
+) -> Option<u16> {
+    let dst_port_be = if proto_has_dst_port(proto) {
+        Some(ctx.load::<u16>(l4_offset + L4_DST_PORT_REL_OFFSET).ok()?)
+    } else {
+        None
+    };
+    parse_l4_dst_port_value(proto, packet_len, l4_offset, dst_port_be)
+}
+
+fn parse_l4_dst_port_value(
     proto: u8,
     packet_len: usize,
     l4_offset: usize,
@@ -445,7 +463,7 @@ fn parse_l4_dst_port(
     if !proto_has_dst_port(proto) {
         return Some(0);
     }
-    if packet_len < l4_offset + L4_DST_PORT_OFFSET + 2 {
+    if packet_len < l4_offset + L4_DST_PORT_REL_OFFSET + 2 {
         return None;
     }
     Some(u16::from_be(dst_port_be?))
@@ -569,17 +587,19 @@ mod tests {
     #[test]
     fn parse_l4_dst_port_requires_complete_transport_header() {
         let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
-        let packet_len = l4_offset + L4_DST_PORT_OFFSET + 1;
-        let parsed = parse_l4_dst_port(IPPROTO_TCP, packet_len, l4_offset, Some(8080_u16.to_be()));
+        let packet_len = l4_offset + L4_DST_PORT_REL_OFFSET + 1;
+        let parsed =
+            parse_l4_dst_port_value(IPPROTO_TCP, packet_len, l4_offset, Some(8080_u16.to_be()));
         assert_eq!(parsed, None);
     }
 
     #[test]
     fn parse_l4_dst_port_extracts_port_for_tcp_udp() {
         let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
-        let packet_len = l4_offset + L4_DST_PORT_OFFSET + 2;
-        let tcp = parse_l4_dst_port(IPPROTO_TCP, packet_len, l4_offset, Some(443_u16.to_be()));
-        let udp = parse_l4_dst_port(IPPROTO_UDP, packet_len, l4_offset, Some(53_u16.to_be()));
+        let packet_len = l4_offset + L4_DST_PORT_REL_OFFSET + 2;
+        let tcp =
+            parse_l4_dst_port_value(IPPROTO_TCP, packet_len, l4_offset, Some(443_u16.to_be()));
+        let udp = parse_l4_dst_port_value(IPPROTO_UDP, packet_len, l4_offset, Some(53_u16.to_be()));
         assert_eq!(tcp, Some(443));
         assert_eq!(udp, Some(53));
     }
@@ -588,7 +608,7 @@ mod tests {
     fn parse_l4_dst_port_uses_wildcard_for_non_tcp_udp() {
         let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
         let packet_len = l4_offset;
-        let parsed = parse_l4_dst_port(1, packet_len, l4_offset, None);
+        let parsed = parse_l4_dst_port_value(1, packet_len, l4_offset, None);
         assert_eq!(parsed, Some(0));
     }
 
