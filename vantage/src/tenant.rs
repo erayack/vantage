@@ -95,7 +95,7 @@ impl TenantRef {
                 Some(proto) => proto.to_u8(),
                 None => 0,
             },
-            _pad: 0,
+            http_method: 0,
         }
     }
 }
@@ -121,12 +121,27 @@ pub(crate) fn normalized_flow_key(tenant: TenantKey) -> String {
     };
 
     format!(
-        "src={}|proto={}|dport={}|path_hash={}",
+        "src={}|proto={}|dport={}|method={}|path_hash={}",
         src_ip_label(tenant.src_ip),
         proto_label(tenant.proto),
         port,
+        http_method_label(tenant.http_method),
         path_hash_label(tenant.http_path_hash)
     )
+}
+
+pub(crate) const fn http_method_label(method: u8) -> &'static str {
+    match method {
+        0 => "*",
+        1 => "get",
+        2 => "post",
+        3 => "put",
+        4 => "delete",
+        5 => "patch",
+        6 => "head",
+        7 => "options",
+        _ => "other",
+    }
 }
 
 pub(crate) fn path_hash_label(http_path_hash: u32) -> String {
@@ -163,6 +178,10 @@ pub(crate) enum TenantParseError {
     MissingProto,
     #[error("http_path and http_path_hash mismatch")]
     PathHashMismatch,
+    #[error(
+        "http selectors require both proto and dst_port when strict policy validation is enabled"
+    )]
+    PartialL7SelectorsRequireFlow,
 }
 
 #[cfg(test)]
@@ -170,8 +189,8 @@ mod tests {
     use vantage_common::TenantKey;
 
     use super::{
-        FlowProto, TenantRef, compute_http_path_hash, normalized_flow_key, path_hash_label,
-        proto_label, src_ip_label,
+        FlowProto, TenantRef, compute_http_path_hash, http_method_label, normalized_flow_key,
+        path_hash_label, proto_label, src_ip_label,
     };
 
     #[test]
@@ -246,7 +265,7 @@ mod tests {
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
-                _pad: 0
+                http_method: 0
             }
         );
     }
@@ -269,7 +288,7 @@ mod tests {
                 http_path_hash: 0,
                 dst_port: 443,
                 proto: 6,
-                _pad: 0
+                http_method: 0
             }
         );
     }
@@ -310,11 +329,11 @@ mod tests {
             http_path_hash: 0x1234_abcd,
             dst_port: 443,
             proto: 6,
-            _pad: 0,
+            http_method: 0,
         };
         assert_eq!(
             normalized_flow_key(tenant),
-            "src=10.1.2.3|proto=tcp|dport=443|path_hash=0x1234abcd"
+            "src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=0x1234abcd"
         );
     }
 
@@ -326,5 +345,13 @@ mod tests {
     #[test]
     fn wildcard_hash_label_is_star() {
         assert_eq!(path_hash_label(0), "*");
+    }
+
+    #[test]
+    fn labels_http_method_for_observability() {
+        assert_eq!(http_method_label(0), "*");
+        assert_eq!(http_method_label(1), "get");
+        assert_eq!(http_method_label(2), "post");
+        assert_eq!(http_method_label(255), "other");
     }
 }

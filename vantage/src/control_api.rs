@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 use vantage_common::{Counters, GlobalStats, Policy, PolicyMatchLevel, ReasonBuckets, TenantKey};
 
 use crate::{
@@ -101,6 +102,7 @@ pub(crate) struct PolicyUpsertResponse {
     pub stored_flow: String,
     pub precedence: &'static str,
     pub effective_for_stored: ResolvedPolicyView,
+    pub warnings: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +223,22 @@ pub(crate) async fn put_policy(
         .with_flow(proto, req.dst_port)?
         .with_http_path_hash(http_path_hash)
         .to_tenant_key();
+    let mut warnings = Vec::new();
+    if partial_l7_policy_key(tenant) {
+        app.metrics.partial_l7_policy_keys_total.inc();
+        if app.config.policy_validation_mode.strict() {
+            return Err(ApiError::Tenant(
+                TenantParseError::PartialL7SelectorsRequireFlow,
+            ));
+        }
+
+        warnings.push(PARTIAL_L7_POLICY_WARNING);
+        warn!(
+            tenant = ?tenant,
+            policy_validation_mode = ?app.config.policy_validation_mode,
+            "accepted partial-l7 policy key with wildcard l4 selectors"
+        );
+    }
     let maps = app.maps;
     let policy = Policy {
         rate_tokens_per_sec: req.rate_tokens_per_sec,
@@ -244,6 +262,7 @@ pub(crate) async fn put_policy(
         stored_flow: normalized_flow_key(tenant),
         precedence: policy_precedence_contract(),
         effective_for_stored,
+        warnings,
     }))
 }
 
@@ -413,7 +432,14 @@ fn parse_http_path_hash(
 }
 
 const fn policy_precedence_contract() -> &'static str {
-    "exact(src_ip,proto,dst_port) > proto_wildcard(src_ip,proto,0) > full_wildcard(src_ip,0,0)"
+    "exact(src_ip,proto,dst_port,http_method,http_path_hash) > path_wildcard(src_ip,proto,dst_port,http_method,0) > method_path_wildcard(src_ip,proto,dst_port,0,0) > port_method_path_wildcard(src_ip,proto,0,0,0) > full_wildcard(src_ip,0,0,0,0)"
+}
+
+const PARTIAL_L7_POLICY_WARNING: &str = "partial L7 policy accepted with wildcard L4 selectors; set proto and dst_port for strict specificity";
+
+const fn partial_l7_policy_key(key: TenantKey) -> bool {
+    let has_l7_selector = key.http_method != 0 || key.http_path_hash != 0;
+    has_l7_selector && (key.proto == 0 || key.dst_port == 0)
 }
 
 const fn policy_scope_from_key(key: TenantKey) -> PolicyMatchLevel {
@@ -422,7 +448,15 @@ const fn policy_scope_from_key(key: TenantKey) -> PolicyMatchLevel {
     }
 
     if key.dst_port == 0 {
-        return PolicyMatchLevel::ProtoWildcard;
+        return PolicyMatchLevel::PortMethodPathWildcard;
+    }
+
+    if key.http_method == 0 {
+        return PolicyMatchLevel::MethodPathWildcard;
+    }
+
+    if key.http_path_hash == 0 {
+        return PolicyMatchLevel::PathWildcard;
     }
 
     PolicyMatchLevel::Exact
@@ -466,7 +500,7 @@ mod tests {
         http::{Request, StatusCode},
         routing::{get, put},
     };
-    use prometheus::{IntGauge, Registry};
+    use prometheus::{IntCounter, IntGauge, Registry};
     use tower::util::ServiceExt as _;
     use vantage_common::{
         Counters, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets,
@@ -474,12 +508,12 @@ mod tests {
     };
 
     use super::{
-        build_top_tenants, debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled,
-        metrics, put_admin_enabled, put_policy, resolve_policy,
+        PARTIAL_L7_POLICY_WARNING, build_top_tenants, debug_cpu_window, debug_snapshot,
+        delete_policy, get_admin_enabled, metrics, put_admin_enabled, put_policy, resolve_policy,
     };
     use crate::{
         AppState, DropEventRuntime, MetricsState,
-        config::Config,
+        config::{Config, PolicyValidationMode},
         map_client::{MapClient, MapError, MapOps},
         tenant::compute_http_path_hash,
     };
@@ -619,6 +653,18 @@ mod tests {
         daemon_up.set(1);
         let register = registry.register(Box::new(daemon_up.clone()));
         assert!(register.is_ok(), "metric registration should succeed");
+        let partial_metric = IntCounter::new(
+            "vantage_partial_l7_policy_keys_total",
+            "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
+        );
+        let Ok(partial_l7_policy_keys_total) = partial_metric else {
+            panic!("metric should initialize");
+        };
+        let register_partial = registry.register(Box::new(partial_l7_policy_keys_total.clone()));
+        assert!(
+            register_partial.is_ok(),
+            "partial-l7 metric registration should succeed"
+        );
 
         AppState {
             config: Config {
@@ -632,6 +678,7 @@ mod tests {
                 metrics_dimensions: crate::config::MetricsDimensions::Aggregate,
                 flow_keys_mode: crate::config::FlowKeysMode::Live,
                 debug_top_tenants: 10,
+                policy_validation_mode: PolicyValidationMode::Permissive,
             },
             drop_events: DropEventRuntime {
                 kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
@@ -642,6 +689,7 @@ mod tests {
             metrics: MetricsState {
                 registry,
                 daemon_up,
+                partial_l7_policy_keys_total,
             },
         }
     }
@@ -667,7 +715,7 @@ mod tests {
                         http_path_hash: 0,
                         dst_port: 443,
                         proto: 6,
-                        _pad: 0,
+                        http_method: 0,
                     },
                     Counters {
                         pass_pkts: 10,
@@ -682,7 +730,7 @@ mod tests {
                         http_path_hash: 0,
                         dst_port: 53,
                         proto: 17,
-                        _pad: 0,
+                        http_method: 0,
                     },
                     Counters {
                         pass_pkts: 5,
@@ -731,7 +779,7 @@ mod tests {
                     http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 },
                 Counters {
                     pass_pkts: 10,
@@ -781,7 +829,7 @@ mod tests {
         assert_eq!(
             payload["precedence"],
             serde_json::json!(
-                "exact(src_ip,proto,dst_port) > proto_wildcard(src_ip,proto,0) > full_wildcard(src_ip,0,0)"
+                "exact(src_ip,proto,dst_port,http_method,http_path_hash) > path_wildcard(src_ip,proto,dst_port,http_method,0) > method_path_wildcard(src_ip,proto,dst_port,0,0) > port_method_path_wildcard(src_ip,proto,0,0,0) > full_wildcard(src_ip,0,0,0,0)"
             )
         );
         assert_eq!(payload["scope"], serde_json::json!("full_wildcard"));
@@ -789,6 +837,7 @@ mod tests {
             payload["effective_for_stored"]["match_level"],
             serde_json::json!("exact")
         );
+        assert_eq!(payload["warnings"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -898,7 +947,7 @@ mod tests {
                     http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 };
                 assert!(
                     policies.contains_key(&tenant),
@@ -943,7 +992,7 @@ mod tests {
                     http_path_hash: compute_http_path_hash("/predict"),
                     dst_port: 443,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 };
                 assert!(
                     policies.contains_key(&tenant),
@@ -954,6 +1003,81 @@ mod tests {
                 panic!("fixture lock should not be poisoned: {error}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn put_policy_warns_on_partial_l7_in_permissive_mode() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"http_path":"/predict"}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(
+            payload["warnings"],
+            serde_json::json!([PARTIAL_L7_POLICY_WARNING])
+        );
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_partial_l7_in_strict_mode() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let mut state = test_state(maps);
+        state.config.policy_validation_mode = PolicyValidationMode::Strict;
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/ip:10.1.2.3")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"http_path":"/predict"}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let text = String::from_utf8(bytes.to_vec());
+        let Ok(text) = text else {
+            panic!("error payload should be utf-8");
+        };
+        assert!(text.contains("http selectors require both proto and dst_port"));
     }
 
     #[tokio::test]
@@ -1249,7 +1373,7 @@ mod tests {
         };
         assert_eq!(
             payload["effective"]["match_level"],
-            serde_json::json!("proto_wildcard")
+            serde_json::json!("port_method_path_wildcard")
         );
         assert_eq!(
             payload["effective"]["matched"]["dst_port"],
@@ -1387,7 +1511,7 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert_eq!(
             top[0]["flow"],
-            serde_json::json!("src=10.1.2.3|proto=tcp|dport=443|path_hash=*")
+            serde_json::json!("src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=*")
         );
     }
 
@@ -1400,7 +1524,7 @@ mod tests {
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 },
                 Counters {
                     pass_pkts: 1,
@@ -1415,7 +1539,7 @@ mod tests {
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 },
                 Counters {
                     pass_pkts: 1,
@@ -1430,7 +1554,7 @@ mod tests {
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
-                    _pad: 0,
+                    http_method: 0,
                 },
                 Counters {
                     pass_pkts: 1,
@@ -1513,7 +1637,7 @@ mod tests {
         let Ok(text) = text else {
             panic!("metrics response should be utf-8");
         };
-        assert!(text.contains("flow=\"src=10.1.2.3|proto=tcp|dport=443|path_hash=*\""));
+        assert!(text.contains("flow=\"src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=*\""));
         assert!(text.contains("src_ip=\"10.1.2.3\""));
     }
 }

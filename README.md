@@ -40,6 +40,7 @@ The eBPF object is compiled and embedded automatically by the build script.
 | `--metrics-dimensional-enabled` | `VANTAGE_METRICS_DIMENSIONAL_ENABLED` | `false` | Emit per-flow labels in `/metrics` (aggregate-only when disabled) |
 | `--flow-keys-mode` | `VANTAGE_FLOW_KEYS_MODE` | `live` | `live` uses `(src_ip, proto, dst_port)` keys; `legacy` uses `(src_ip, 0, 0)` |
 | `--debug-top-tenants` | `VANTAGE_DEBUG_TOP_TENANTS` | `10` | Max number of top drop tenants returned by `/debug/snapshot` |
+| `--policy-validation-mode` | `VANTAGE_POLICY_VALIDATION_MODE` | `permissive` | `permissive` accepts partial L7 selectors with warnings; `strict` requires `proto` + `dst_port` when HTTP selectors are set |
 
 ## API
 
@@ -74,9 +75,12 @@ FNV-1a (32-bit) and writes only numeric `http_path_hash` into policy-map keys:
 { "rate_tokens_per_sec": 1000, "burst_tokens": 5000, "enabled": true, "proto": "tcp", "dst_port": 8080, "http_path_hash": 4021474487 }
 ```
 
+`PUT /policy` responses include `warnings`; in permissive mode, partial L7 selectors
+(`http_path`/`http_path_hash` without full L4 selectors) are accepted with warnings.
+
 Policy precedence is explicit and enforced consistently across API and kernel data-path:
 
-`exact(src_ip, proto, dst_port) > proto_wildcard(src_ip, proto, 0) > full_wildcard(src_ip, 0, 0)`
+`exact(src_ip, proto, dst_port, http_method, http_path_hash) > path_wildcard(src_ip, proto, dst_port, http_method, 0) > method_path_wildcard(src_ip, proto, dst_port, 0, 0) > port_method_path_wildcard(src_ip, proto, 0, 0, 0) > full_wildcard(src_ip, 0, 0, 0, 0)`
 
 ## Quality Gate
 

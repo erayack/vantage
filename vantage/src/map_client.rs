@@ -95,16 +95,25 @@ impl MapClient {
     /// Resolves the effective policy for a tenant using precedence rules.
     ///
     /// Precedence order:
-    /// 1. exact `(src_ip, proto, dst_port)`
-    /// 2. proto wildcard `(src_ip, proto, 0)`
-    /// 3. full wildcard `(src_ip, 0, 0)`
+    /// 1. exact `(src_ip, proto, dst_port, http_method, http_path_hash)`
+    /// 2. path wildcard `(src_ip, proto, dst_port, http_method, 0)`
+    /// 3. method+path wildcard `(src_ip, proto, dst_port, 0, 0)`
+    /// 4. L4/L7 wildcard `(src_ip, proto, 0, 0, 0)`
+    /// 5. full wildcard `(src_ip, 0, 0, 0, 0)`
     ///
     /// # Errors
     ///
     /// Returns `MapError` when map access fails.
     pub fn resolve_policy(&self, requested: TenantKey) -> Result<Option<ResolvedPolicy>, MapError> {
-        let (exact, proto_wildcard, full_wildcard) = fallback_policy_keys(requested);
-        let candidates = [Some(exact), proto_wildcard, full_wildcard];
+        let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
+            fallback_policy_keys(requested);
+        let candidates = [
+            Some(exact),
+            path_wildcard,
+            method_path_wildcard,
+            port_method_path_wildcard,
+            full_wildcard,
+        ];
         let mut prior: Option<TenantKey> = None;
 
         for candidate in candidates.into_iter().flatten() {
@@ -529,7 +538,7 @@ mod tests {
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
-                _pad: 0,
+                http_method: 0,
             },
             Counters {
                 pass_pkts: 5,
@@ -553,7 +562,7 @@ mod tests {
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
-                _pad: 0
+                http_method: 0
             }
         );
         assert_eq!(collected[0].1.pass_pkts, 5);
@@ -578,7 +587,7 @@ mod tests {
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
-            _pad: 0,
+            http_method: 0,
         };
 
         let inserted = maps.upsert_policy(key, policy);
@@ -660,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_policy_uses_exact_then_proto_then_full_wildcard() {
+    fn resolve_policy_uses_exact_then_port_method_path_then_full_wildcard() {
         let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
         let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
         let exact_key = TenantKey {
@@ -668,21 +677,21 @@ mod tests {
             http_path_hash: 0,
             proto: 6,
             dst_port: 443,
-            _pad: 0,
+            http_method: 0,
         };
-        let proto_wildcard_key = TenantKey {
+        let port_method_path_wildcard_key = TenantKey {
             src_ip: exact_key.src_ip,
             http_path_hash: exact_key.http_path_hash,
             proto: exact_key.proto,
             dst_port: 0,
-            _pad: 0,
+            http_method: 0,
         };
         let full_wildcard_key = TenantKey {
             src_ip: exact_key.src_ip,
             http_path_hash: exact_key.http_path_hash,
             proto: 0,
             dst_port: 0,
-            _pad: 0,
+            http_method: 0,
         };
 
         let upsert_full = maps.upsert_policy(
@@ -706,8 +715,8 @@ mod tests {
         assert_eq!(resolved_full.matched, full_wildcard_key);
         assert_eq!(resolved_full.match_level, PolicyMatchLevel::FullWildcard);
 
-        let upsert_proto = maps.upsert_policy(
-            proto_wildcard_key,
+        let upsert_port_method_path = maps.upsert_policy(
+            port_method_path_wildcard_key,
             Policy {
                 rate_tokens_per_sec: 200,
                 burst_tokens: 20,
@@ -715,17 +724,23 @@ mod tests {
                 _pad: [0; 7],
             },
         );
-        assert!(upsert_proto.is_ok(), "proto wildcard insert should succeed");
+        assert!(
+            upsert_port_method_path.is_ok(),
+            "port/method/path wildcard insert should succeed"
+        );
 
         let resolved_proto = maps.resolve_policy(exact_key);
         let Ok(resolved_proto) = resolved_proto else {
             panic!("policy resolution should succeed");
         };
         let Some(resolved_proto) = resolved_proto else {
-            panic!("proto wildcard fallback should resolve");
+            panic!("port/method/path wildcard fallback should resolve");
         };
-        assert_eq!(resolved_proto.matched, proto_wildcard_key);
-        assert_eq!(resolved_proto.match_level, PolicyMatchLevel::ProtoWildcard);
+        assert_eq!(resolved_proto.matched, port_method_path_wildcard_key);
+        assert_eq!(
+            resolved_proto.match_level,
+            PolicyMatchLevel::PortMethodPathWildcard
+        );
 
         let upsert_exact = maps.upsert_policy(
             exact_key,

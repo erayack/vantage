@@ -21,7 +21,7 @@ use aya::{
     programs::{SchedClassifier, TcAttachType, tc},
     util::KernelVersion,
 };
-use prometheus::{IntGauge, Registry};
+use prometheus::{IntCounter, IntGauge, Registry};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{signal, sync::watch};
@@ -43,6 +43,7 @@ use crate::{
 pub(crate) struct MetricsState {
     pub(crate) registry: Registry,
     pub(crate) daemon_up: IntGauge,
+    pub(crate) partial_l7_policy_keys_total: IntCounter,
 }
 
 #[derive(Clone)]
@@ -235,10 +236,16 @@ fn build_metrics_state() -> anyhow::Result<MetricsState> {
     let daemon_up = IntGauge::new("vantage_daemon_up", "Daemon running state")?;
     daemon_up.set(1);
     registry.register(Box::new(daemon_up.clone()))?;
+    let partial_l7_policy_keys_total = IntCounter::new(
+        "vantage_partial_l7_policy_keys_total",
+        "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
+    )?;
+    registry.register(Box::new(partial_l7_policy_keys_total.clone()))?;
 
     Ok(MetricsState {
         registry,
         daemon_up,
+        partial_l7_policy_keys_total,
     })
 }
 
@@ -285,7 +292,7 @@ mod tests {
         Ebpf,
         programs::{SchedClassifier, TcAttachType, tc},
     };
-    use prometheus::{IntGauge, Registry};
+    use prometheus::{IntCounter, IntGauge, Registry};
     use vantage_common::{
         Counters, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, ReasonBuckets,
         TenantKey,
@@ -368,6 +375,11 @@ mod tests {
             metrics: MetricsState {
                 registry,
                 daemon_up,
+                partial_l7_policy_keys_total: IntCounter::new(
+                    "vantage_partial_l7_policy_keys_total",
+                    "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
         }
     }
@@ -385,6 +397,7 @@ mod tests {
             metrics_dimensions: crate::config::MetricsDimensions::Aggregate,
             flow_keys_mode: crate::config::FlowKeysMode::Live,
             debug_top_tenants: 10,
+            policy_validation_mode: crate::config::PolicyValidationMode::Permissive,
         };
         assert_eq!(direction_name(&config), "both");
     }
@@ -402,6 +415,7 @@ mod tests {
             metrics_dimensions: crate::config::MetricsDimensions::PerFlow,
             flow_keys_mode: crate::config::FlowKeysMode::Legacy,
             debug_top_tenants: 25,
+            policy_validation_mode: crate::config::PolicyValidationMode::Permissive,
         };
         let state = test_state(
             config,

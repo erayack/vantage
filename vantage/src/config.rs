@@ -34,6 +34,18 @@ impl MetricsDimensions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PolicyValidationMode {
+    Permissive,
+    Strict,
+}
+
+impl PolicyValidationMode {
+    pub(crate) const fn strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "vantage")]
 struct Cli {
@@ -81,6 +93,13 @@ struct Cli {
         env = "VANTAGE_DEBUG_TOP_TENANTS"
     )]
     debug_top_tenants: usize,
+    #[arg(
+        long = "policy-validation-mode",
+        value_enum,
+        default_value_t = PolicyValidationMode::Permissive,
+        env = "VANTAGE_POLICY_VALIDATION_MODE"
+    )]
+    policy_validation_mode: PolicyValidationMode,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +114,7 @@ pub(crate) struct Config {
     pub(crate) metrics_dimensions: MetricsDimensions,
     pub(crate) flow_keys_mode: FlowKeysMode,
     pub(crate) debug_top_tenants: usize,
+    pub(crate) policy_validation_mode: PolicyValidationMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +171,7 @@ impl Config {
             },
             flow_keys_mode: cli.flow_keys_mode,
             debug_top_tenants: cli.debug_top_tenants.clamp(1, 100),
+            policy_validation_mode: cli.policy_validation_mode,
         }
     }
 
@@ -164,7 +185,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, MetricsDimensions};
+    use super::{Config, MetricsDimensions, PolicyValidationMode};
 
     #[test]
     fn attach_direction_from_env_is_respected() {
@@ -279,6 +300,28 @@ mod tests {
             panic!("config parsing should succeed");
         };
         assert!(!config.flow_keys_mode.live());
+    }
+
+    #[test]
+    fn policy_validation_mode_defaults_to_permissive() {
+        let parsed = Config::try_from_iter(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(
+            config.policy_validation_mode,
+            PolicyValidationMode::Permissive
+        );
+    }
+
+    #[test]
+    fn policy_validation_mode_can_be_set_to_strict() {
+        let parsed = Config::try_from_iter(["vantage", "--policy-validation-mode", "strict"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.policy_validation_mode, PolicyValidationMode::Strict);
+        assert!(config.policy_validation_mode.strict());
     }
 
     #[test]

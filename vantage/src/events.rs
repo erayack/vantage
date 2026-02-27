@@ -161,6 +161,7 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
             .ok()?,
     );
     let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 10)?;
+    let http_method = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 11)?;
     let ts_ns = u64::from_ne_bytes(
         payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
             .try_into()
@@ -174,7 +175,7 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
             http_path_hash,
             dst_port,
             proto,
-            _pad: 0,
+            http_method,
         },
         ts_ns,
         reason: reason_name(reason_code),
@@ -241,7 +242,7 @@ mod tests {
                 http_path_hash: 0x1234_abcd,
                 dst_port: 443,
                 proto: 6,
-                _pad: 0,
+                http_method: 1,
             },
             reason: DropReason::NoTokens.as_u8(),
             _pad: [0; 7],
@@ -256,6 +257,7 @@ mod tests {
         payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 10]
             .copy_from_slice(&event.tenant_key.dst_port.to_ne_bytes());
         payload[DROP_EVENT_TENANT_KEY_OFFSET + 10] = event.tenant_key.proto;
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 11] = event.tenant_key.http_method;
         payload[DROP_EVENT_REASON_OFFSET] = event.reason;
 
         let decoded = decode_drop_event(&payload);

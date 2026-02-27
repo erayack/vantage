@@ -143,7 +143,7 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
-            _pad: 0,
+            http_method: 0,
         });
     }
 
@@ -154,7 +154,7 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
         http_path_hash: 0,
         dst_port,
         proto,
-        _pad: 0,
+        http_method: 0,
     })
 }
 
@@ -232,19 +232,24 @@ fn read_policy(key: TenantKey) -> Option<Policy> {
 }
 
 fn read_policy_with_fallback(key: TenantKey) -> Option<Policy> {
-    let (exact_key, proto_wildcard_key, full_wildcard_key) = fallback_policy_keys(key);
-    if let Some(policy) = read_policy(exact_key) {
-        return Some(policy);
-    }
+    let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
+        fallback_policy_keys(key);
+    let candidates = [
+        Some(exact),
+        path_wildcard,
+        method_path_wildcard,
+        port_method_path_wildcard,
+        full_wildcard,
+    ];
+    let mut prior: Option<TenantKey> = None;
 
-    if let Some(proto_wildcard_key) = proto_wildcard_key {
-        if let Some(policy) = read_policy(proto_wildcard_key) {
-            return Some(policy);
+    for candidate in candidates.into_iter().flatten() {
+        if prior == Some(candidate) {
+            continue;
         }
-    }
+        prior = Some(candidate);
 
-    if let Some(full_wildcard_key) = full_wildcard_key {
-        if let Some(policy) = read_policy(full_wildcard_key) {
+        if let Some(policy) = read_policy(candidate) {
             return Some(policy);
         }
     }
@@ -543,36 +548,48 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_keys_use_exact_then_proto_then_full_wildcard() {
+    fn fallback_policy_keys_use_exact_then_path_then_port_method_path_then_full_wildcard() {
         let key = TenantKey {
             src_ip: 0x0a00_0001,
             http_path_hash: 0x1234,
             dst_port: 443,
             proto: IPPROTO_TCP,
-            _pad: 0,
+            http_method: 0,
         };
 
-        let (exact, proto_wildcard, full_wildcard) = fallback_policy_keys(key);
+        let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
+            fallback_policy_keys(key);
 
         assert_eq!(exact, key);
+        assert_eq!(method_path_wildcard, None);
         assert_eq!(
-            proto_wildcard,
+            path_wildcard,
             Some(TenantKey {
                 src_ip: key.src_ip,
-                http_path_hash: key.http_path_hash,
+                http_path_hash: 0,
+                dst_port: key.dst_port,
+                proto: IPPROTO_TCP,
+                http_method: 0,
+            })
+        );
+        assert_eq!(
+            port_method_path_wildcard,
+            Some(TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
                 dst_port: 0,
                 proto: IPPROTO_TCP,
-                _pad: 0,
+                http_method: 0,
             })
         );
         assert_eq!(
             full_wildcard,
             Some(TenantKey {
                 src_ip: key.src_ip,
-                http_path_hash: key.http_path_hash,
+                http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
-                _pad: 0,
+                http_method: 0,
             })
         );
     }
@@ -584,12 +601,15 @@ mod tests {
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
-            _pad: 0,
+            http_method: 0,
         };
 
-        let (_exact, proto_wildcard, full_wildcard) = fallback_policy_keys(key);
+        let (_exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
+            fallback_policy_keys(key);
 
-        assert_eq!(proto_wildcard, None);
+        assert_eq!(path_wildcard, None);
+        assert_eq!(method_path_wildcard, None);
+        assert_eq!(port_method_path_wildcard, None);
         assert_eq!(full_wildcard, None);
     }
 

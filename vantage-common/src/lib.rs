@@ -7,8 +7,8 @@ use aya::Pod;
 /// userspace-provided HTTP path hash selector.
 ///
 /// No application payload fields are part of kernel-side key extraction.
-/// `dst_port`, `proto`, and `http_path_hash` support wildcard semantics for
-/// fallback matching (`0` => wildcard).
+/// `dst_port`, `proto`, `http_method`, and `http_path_hash` support wildcard
+/// semantics for fallback matching (`0` => wildcard).
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
 #[cfg_attr(feature = "user", derive(serde::Deserialize, serde::Serialize))]
@@ -18,8 +18,17 @@ pub struct TenantKey {
     pub http_path_hash: u32, // 0 => wildcard
     pub dst_port: u16,       // 0 => wildcard
     pub proto: u8,           // 0 => wildcard, 6 => TCP, 17 => UDP
-    pub _pad: u8,
+    pub http_method: u8,     // 0 => wildcard
 }
+
+pub const HTTP_METHOD_ANY: u8 = 0;
+pub const HTTP_METHOD_GET: u8 = 1;
+pub const HTTP_METHOD_POST: u8 = 2;
+pub const HTTP_METHOD_PUT: u8 = 3;
+pub const HTTP_METHOD_DELETE: u8 = 4;
+pub const HTTP_METHOD_PATCH: u8 = 5;
+pub const HTTP_METHOD_HEAD: u8 = 6;
+pub const HTTP_METHOD_OPTIONS: u8 = 7;
 
 /// Computes 32-bit FNV-1a hash for HTTP path selector keying.
 #[must_use]
@@ -40,52 +49,114 @@ pub const fn fnv1a_32(bytes: &[u8]) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyMatchLevel {
     Exact = 0,
-    ProtoWildcard = 1,
-    FullWildcard = 2,
+    PathWildcard = 1,
+    MethodPathWildcard = 2,
+    PortMethodPathWildcard = 3,
+    FullWildcard = 4,
 }
 
 #[must_use]
+/// Builds deterministic policy fallback candidates in precedence order:
+/// 1. exact `(src_ip, proto, dst_port, http_method, http_path_hash)`
+/// 2. path wildcard `(src_ip, proto, dst_port, http_method, 0)`
+/// 3. method+path wildcard `(src_ip, proto, dst_port, 0, 0)`
+/// 4. L4/L7 wildcard `(src_ip, proto, 0, 0, 0)`
+/// 5. full wildcard `(src_ip, 0, 0, 0, 0)`
 pub const fn fallback_policy_keys(
     key: TenantKey,
-) -> (TenantKey, Option<TenantKey>, Option<TenantKey>) {
+) -> (
+    TenantKey,
+    Option<TenantKey>,
+    Option<TenantKey>,
+    Option<TenantKey>,
+    Option<TenantKey>,
+) {
     let exact_key = key;
-    let proto_wildcard_key = if key.dst_port != 0 {
+    let path_wildcard_key = if key.http_path_hash != 0 {
         Some(TenantKey {
             src_ip: key.src_ip,
-            http_path_hash: key.http_path_hash,
-            dst_port: 0,
+            http_path_hash: 0,
+            dst_port: key.dst_port,
             proto: key.proto,
-            _pad: 0,
+            http_method: key.http_method,
         })
     } else {
         None
     };
-    let full_wildcard_key = if key.proto != 0 || key.dst_port != 0 {
+    let method_path_wildcard_key = if key.http_method != 0 || key.http_path_hash != 0 {
         Some(TenantKey {
             src_ip: key.src_ip,
-            http_path_hash: key.http_path_hash,
-            dst_port: 0,
-            proto: 0,
-            _pad: 0,
+            http_path_hash: 0,
+            dst_port: key.dst_port,
+            proto: key.proto,
+            http_method: 0,
         })
     } else {
         None
     };
+    let port_method_path_wildcard_key =
+        if key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
+            Some(TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: key.proto,
+                http_method: 0,
+            })
+        } else {
+            None
+        };
+    let full_wildcard_key =
+        if key.proto != 0 || key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
+            Some(TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0,
+            })
+        } else {
+            None
+        };
 
-    (exact_key, proto_wildcard_key, full_wildcard_key)
+    (
+        exact_key,
+        path_wildcard_key,
+        method_path_wildcard_key,
+        port_method_path_wildcard_key,
+        full_wildcard_key,
+    )
 }
 
 #[must_use]
 pub fn policy_match_level(requested: TenantKey, matched: TenantKey) -> Option<PolicyMatchLevel> {
-    let (exact_key, proto_wildcard_key, full_wildcard_key) = fallback_policy_keys(requested);
+    let (
+        exact_key,
+        path_wildcard_key,
+        method_path_wildcard_key,
+        port_method_path_wildcard_key,
+        full_wildcard_key,
+    ) = fallback_policy_keys(requested);
     if matched == exact_key {
         return Some(PolicyMatchLevel::Exact);
     }
 
-    if let Some(proto_wildcard) = proto_wildcard_key
-        && matched == proto_wildcard
+    if let Some(path_wildcard) = path_wildcard_key
+        && matched == path_wildcard
     {
-        return Some(PolicyMatchLevel::ProtoWildcard);
+        return Some(PolicyMatchLevel::PathWildcard);
+    }
+
+    if let Some(method_path_wildcard) = method_path_wildcard_key
+        && matched == method_path_wildcard
+    {
+        return Some(PolicyMatchLevel::MethodPathWildcard);
+    }
+
+    if let Some(port_method_path_wildcard) = port_method_path_wildcard_key
+        && matched == port_method_path_wildcard
+    {
+        return Some(PolicyMatchLevel::PortMethodPathWildcard);
     }
 
     if let Some(full_wildcard) = full_wildcard_key
@@ -279,3 +350,103 @@ unsafe impl Pod for GlobalConfig {}
 #[cfg(feature = "user")]
 // SAFETY: `DropEvent` is `repr(C)` and contains only plain integer fields.
 unsafe impl Pod for DropEvent {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HTTP_METHOD_POST, PolicyMatchLevel, TenantKey, fallback_policy_keys, fnv1a_32,
+        policy_match_level,
+    };
+
+    #[test]
+    fn fallback_policy_keys_follow_deterministic_precedence() {
+        let key = TenantKey {
+            src_ip: 0x0a00_0001,
+            http_path_hash: 0x1234_abcd,
+            dst_port: 443,
+            proto: 6,
+            http_method: HTTP_METHOD_POST,
+        };
+
+        let (exact, path, method_path, port_method_path, full) = fallback_policy_keys(key);
+        let Some(path) = path else {
+            panic!("path wildcard should exist");
+        };
+        let Some(method_path) = method_path else {
+            panic!("method+path wildcard should exist");
+        };
+        let Some(port_method_path) = port_method_path else {
+            panic!("port+method+path wildcard should exist");
+        };
+        let Some(full) = full else {
+            panic!("full wildcard should exist");
+        };
+
+        assert_eq!(exact, key);
+        assert_eq!(
+            path,
+            TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: key.dst_port,
+                proto: key.proto,
+                http_method: key.http_method,
+            }
+        );
+        assert_eq!(
+            method_path,
+            TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: key.dst_port,
+                proto: key.proto,
+                http_method: 0,
+            }
+        );
+        assert_eq!(
+            port_method_path,
+            TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: key.proto,
+                http_method: 0,
+            }
+        );
+        assert_eq!(
+            full,
+            TenantKey {
+                src_ip: key.src_ip,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0,
+            }
+        );
+        assert_eq!(
+            policy_match_level(key, exact),
+            Some(PolicyMatchLevel::Exact)
+        );
+        assert_eq!(
+            policy_match_level(key, path),
+            Some(PolicyMatchLevel::PathWildcard)
+        );
+        assert_eq!(
+            policy_match_level(key, method_path),
+            Some(PolicyMatchLevel::MethodPathWildcard)
+        );
+        assert_eq!(
+            policy_match_level(key, port_method_path),
+            Some(PolicyMatchLevel::PortMethodPathWildcard)
+        );
+        assert_eq!(
+            policy_match_level(key, full),
+            Some(PolicyMatchLevel::FullWildcard)
+        );
+    }
+
+    #[test]
+    fn fnv1a_hash_matches_known_vector() {
+        assert_eq!(fnv1a_32(b"/predict"), 0xefb2_d4b7);
+    }
+}
