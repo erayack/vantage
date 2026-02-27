@@ -15,7 +15,7 @@ use vantage_common::{
     DropReason, TenantKey,
 };
 
-use crate::tenant::{normalized_flow_key, proto_label, src_ip_label};
+use crate::tenant::{cgroup_id_label, normalized_flow_key, proto_label};
 
 const DROP_EVENTS_MAP: &str = "DROP_EVENTS";
 const MAX_EVENTS_PER_WAKE: usize = 1024;
@@ -87,7 +87,7 @@ pub(crate) async fn run_drop_event_consumer(
                                 info!(
                                     tenant = ?event.tenant,
                                     flow_key = %flow_key,
-                                    src_ip = %src_ip_label(event.tenant.src_ip),
+                                    cgroup_id = %cgroup_id_label(event.tenant.cgroup_id),
                                     proto = proto_label(event.tenant.proto),
                                     dst_port = event.tenant.dst_port,
                                     reason = event.reason,
@@ -145,23 +145,23 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
         return None;
     }
 
-    let src_ip = u32::from_ne_bytes(
-        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 4]
+    let cgroup_id = u64::from_ne_bytes(
+        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 8]
             .try_into()
             .ok()?,
     );
     let http_path_hash = u32::from_ne_bytes(
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 8]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 12]
             .try_into()
             .ok()?,
     );
     let dst_port = u16::from_ne_bytes(
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 10]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 12..DROP_EVENT_TENANT_KEY_OFFSET + 14]
             .try_into()
             .ok()?,
     );
-    let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 10)?;
-    let http_method = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 11)?;
+    let proto = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 14)?;
+    let http_method = *payload.get(DROP_EVENT_TENANT_KEY_OFFSET + 15)?;
     let ts_ns = u64::from_ne_bytes(
         payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
             .try_into()
@@ -171,7 +171,7 @@ fn decode_drop_event(payload: &[u8]) -> Option<DecodedDropEvent> {
 
     Some(DecodedDropEvent {
         tenant: TenantKey {
-            src_ip,
+            cgroup_id,
             http_path_hash,
             dst_port,
             proto,
@@ -238,7 +238,7 @@ mod tests {
         let event = DropEvent {
             ts_ns: 1234,
             tenant_key: TenantKey {
-                src_ip: 0x0a00_0001,
+                cgroup_id: 0x0a00_0001,
                 http_path_hash: 0x1234_abcd,
                 dst_port: 443,
                 proto: 6,
@@ -250,14 +250,14 @@ mod tests {
         let mut payload = [0_u8; size_of::<DropEvent>()];
         payload[DROP_EVENT_TS_NS_OFFSET..DROP_EVENT_TS_NS_OFFSET + 8]
             .copy_from_slice(&event.ts_ns.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 4]
-            .copy_from_slice(&event.tenant_key.src_ip.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 4..DROP_EVENT_TENANT_KEY_OFFSET + 8]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET..DROP_EVENT_TENANT_KEY_OFFSET + 8]
+            .copy_from_slice(&event.tenant_key.cgroup_id.to_ne_bytes());
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 12]
             .copy_from_slice(&event.tenant_key.http_path_hash.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 8..DROP_EVENT_TENANT_KEY_OFFSET + 10]
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 12..DROP_EVENT_TENANT_KEY_OFFSET + 14]
             .copy_from_slice(&event.tenant_key.dst_port.to_ne_bytes());
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 10] = event.tenant_key.proto;
-        payload[DROP_EVENT_TENANT_KEY_OFFSET + 11] = event.tenant_key.http_method;
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 14] = event.tenant_key.proto;
+        payload[DROP_EVENT_TENANT_KEY_OFFSET + 15] = event.tenant_key.http_method;
         payload[DROP_EVENT_REASON_OFFSET] = event.reason;
 
         let decoded = decode_drop_event(&payload);

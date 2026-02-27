@@ -1,7 +1,5 @@
-use std::{net::Ipv4Addr, str::FromStr};
-
 use thiserror::Error;
-use vantage_common::{TenantKey, fnv1a_32};
+use vantage_common::{HTTP_METHOD_GET, HTTP_METHOD_POST, TenantKey, fnv1a_32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlowProto {
@@ -31,30 +29,48 @@ impl FlowProto {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+impl HttpMethod {
+    const fn parse(raw: &str) -> Result<Self, TenantParseError> {
+        if raw.eq_ignore_ascii_case("get") {
+            return Ok(Self::Get);
+        }
+
+        if raw.eq_ignore_ascii_case("post") {
+            return Ok(Self::Post);
+        }
+
+        Err(TenantParseError::InvalidHttpMethod)
+    }
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Get => HTTP_METHOD_GET,
+            Self::Post => HTTP_METHOD_POST,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TenantRef {
-    src_ip: u32,
+    cgroup_id: u64,
     proto: Option<FlowProto>,
     dst_port: Option<u16>,
+    http_method: Option<HttpMethod>,
     http_path_hash: Option<u32>,
 }
 
 impl TenantRef {
     pub(crate) fn parse(raw: &str) -> Result<Self, TenantParseError> {
-        if let Some(value) = raw.strip_prefix("ip:") {
-            return parse_ipv4(value);
+        if let Some(value) = raw.strip_prefix("cg:") {
+            return parse_cgroup_id(value);
         }
 
-        if raw.contains('.') {
-            return parse_ipv4(raw);
-        }
-
-        let src_ip = raw.parse::<u32>().map_err(|_| TenantParseError::Invalid)?;
-        Ok(Self {
-            src_ip,
-            proto: None,
-            dst_port: None,
-            http_path_hash: None,
-        })
+        parse_cgroup_id(raw)
     }
 
     pub(crate) const fn with_flow(
@@ -75,14 +91,33 @@ impl TenantRef {
         Ok(self)
     }
 
-    pub(crate) const fn with_http_path_hash(mut self, http_path_hash: Option<u32>) -> Self {
-        self.http_path_hash = http_path_hash;
-        self
+    pub(crate) fn with_http_selectors(
+        mut self,
+        http_method: Option<&str>,
+        http_path: Option<&str>,
+        http_path_hash: Option<u32>,
+    ) -> Result<Self, TenantParseError> {
+        self.http_method = match http_method {
+            Some(raw) => Some(HttpMethod::parse(raw)?),
+            None => None,
+        };
+
+        let computed_hash = http_path.map(compute_http_path_hash);
+        self.http_path_hash = match (computed_hash, http_path_hash) {
+            (Some(computed), Some(explicit)) if computed != explicit => {
+                return Err(TenantParseError::PathHashMismatch);
+            }
+            (Some(computed), _) => Some(computed),
+            (None, Some(explicit)) => Some(explicit),
+            (None, None) => None,
+        };
+
+        Ok(self)
     }
 
     pub(crate) const fn to_tenant_key(self) -> TenantKey {
         TenantKey {
-            src_ip: self.src_ip,
+            cgroup_id: self.cgroup_id,
             http_path_hash: match self.http_path_hash {
                 Some(hash) => hash,
                 None => 0,
@@ -95,13 +130,16 @@ impl TenantRef {
                 Some(proto) => proto.to_u8(),
                 None => 0,
             },
-            http_method: 0,
+            http_method: match self.http_method {
+                Some(method) => method.to_u8(),
+                None => 0,
+            },
         }
     }
 }
 
-pub(crate) fn src_ip_label(src_ip: u32) -> String {
-    Ipv4Addr::from(src_ip).to_string()
+pub(crate) fn cgroup_id_label(cgroup_id: u64) -> String {
+    cgroup_id.to_string()
 }
 
 pub(crate) const fn proto_label(proto: u8) -> &'static str {
@@ -121,8 +159,8 @@ pub(crate) fn normalized_flow_key(tenant: TenantKey) -> String {
     };
 
     format!(
-        "src={}|proto={}|dport={}|method={}|path_hash={}",
-        src_ip_label(tenant.src_ip),
+        "cgroup={}|proto={}|dport={}|method={}|path_hash={}",
+        cgroup_id_label(tenant.cgroup_id),
         proto_label(tenant.proto),
         port,
         http_method_label(tenant.http_method),
@@ -156,12 +194,13 @@ pub(crate) const fn compute_http_path_hash(http_path: &str) -> u32 {
     fnv1a_32(http_path.as_bytes())
 }
 
-fn parse_ipv4(raw: &str) -> Result<TenantRef, TenantParseError> {
-    let addr = Ipv4Addr::from_str(raw).map_err(|_| TenantParseError::Invalid)?;
+fn parse_cgroup_id(raw: &str) -> Result<TenantRef, TenantParseError> {
+    let cgroup_id = raw.parse::<u64>().map_err(|_| TenantParseError::Invalid)?;
     Ok(TenantRef {
-        src_ip: u32::from(addr),
+        cgroup_id,
         proto: None,
         dst_port: None,
+        http_method: None,
         http_path_hash: None,
     })
 }
@@ -172,6 +211,8 @@ pub(crate) enum TenantParseError {
     Invalid,
     #[error("invalid proto, expected tcp|udp")]
     InvalidProto,
+    #[error("invalid http_method, expected get|post")]
+    InvalidHttpMethod,
     #[error("dst_port is required when proto is set")]
     MissingDstPort,
     #[error("proto is required when dst_port is set")]
@@ -189,46 +230,30 @@ mod tests {
     use vantage_common::TenantKey;
 
     use super::{
-        FlowProto, TenantRef, compute_http_path_hash, http_method_label, normalized_flow_key,
-        path_hash_label, proto_label, src_ip_label,
+        FlowProto, TenantRef, cgroup_id_label, compute_http_path_hash, http_method_label,
+        normalized_flow_key, path_hash_label, proto_label,
     };
 
     #[test]
-    fn parses_canonical_ip_prefix() {
-        let parsed = TenantRef::parse("ip:10.1.2.3");
+    fn parses_canonical_cgroup_prefix() {
+        let parsed = TenantRef::parse("cg:167838211");
         let Ok(tenant) = parsed else {
             panic!("tenant parsing should succeed");
         };
         assert_eq!(
             tenant,
             TenantRef {
-                src_ip: 167_838_211,
+                cgroup_id: 167_838_211,
                 proto: None,
                 dst_port: None,
+                http_method: None,
                 http_path_hash: None,
             }
         );
     }
 
     #[test]
-    fn parses_bare_ipv4() {
-        let parsed = TenantRef::parse("10.1.2.3");
-        let Ok(tenant) = parsed else {
-            panic!("tenant parsing should succeed");
-        };
-        assert_eq!(
-            tenant,
-            TenantRef {
-                src_ip: 167_838_211,
-                proto: None,
-                dst_port: None,
-                http_path_hash: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_legacy_u32() {
+    fn parses_bare_u64() {
         let parsed = TenantRef::parse("167838211");
         let Ok(tenant) = parsed else {
             panic!("tenant parsing should succeed");
@@ -236,9 +261,10 @@ mod tests {
         assert_eq!(
             tenant,
             TenantRef {
-                src_ip: 167_838_211,
+                cgroup_id: 167_838_211,
                 proto: None,
                 dst_port: None,
+                http_method: None,
                 http_path_hash: None,
             }
         );
@@ -253,15 +279,16 @@ mod tests {
     #[test]
     fn converts_tenant_ref_to_key() {
         let tenant = TenantRef {
-            src_ip: 42,
+            cgroup_id: 42,
             proto: None,
             dst_port: None,
+            http_method: None,
             http_path_hash: None,
         };
         assert_eq!(
             tenant.to_tenant_key(),
             TenantKey {
-                src_ip: 42,
+                cgroup_id: 42,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
@@ -272,7 +299,7 @@ mod tests {
 
     #[test]
     fn converts_flow_aware_tenant_ref_to_key() {
-        let base = TenantRef::parse("ip:10.1.2.3");
+        let base = TenantRef::parse("cg:167838211");
         let Ok(base) = base else {
             panic!("tenant parsing should succeed");
         };
@@ -284,7 +311,7 @@ mod tests {
         assert_eq!(
             tenant.to_tenant_key(),
             TenantKey {
-                src_ip: 167_838_211,
+                cgroup_id: 167_838_211,
                 http_path_hash: 0,
                 dst_port: 443,
                 proto: 6,
@@ -314,8 +341,60 @@ mod tests {
     }
 
     #[test]
-    fn labels_proto_and_ip_for_observability() {
-        assert_eq!(src_ip_label(167_838_211), "10.1.2.3");
+    fn normalizes_http_method_and_path_hash() {
+        let base = TenantRef::parse("42");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let selector = base.with_http_selectors(Some("POST"), Some("/predict"), None);
+        let Ok(selector) = selector else {
+            panic!("http selector parsing should succeed");
+        };
+        assert_eq!(
+            selector.to_tenant_key(),
+            TenantKey {
+                cgroup_id: 42,
+                http_path_hash: compute_http_path_hash("/predict"),
+                dst_port: 0,
+                proto: 0,
+                http_method: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_http_method() {
+        let base = TenantRef::parse("42");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let parsed = base.with_http_selectors(Some("trace"), None, None);
+        assert!(parsed.is_err(), "invalid method should fail");
+    }
+
+    #[test]
+    fn rejects_http_method_not_supported_by_kernel_parser() {
+        let base = TenantRef::parse("42");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let parsed = base.with_http_selectors(Some("put"), None, None);
+        assert!(parsed.is_err(), "unsupported method should fail");
+    }
+
+    #[test]
+    fn rejects_mismatched_http_path_and_hash() {
+        let base = TenantRef::parse("42");
+        let Ok(base) = base else {
+            panic!("tenant parsing should succeed");
+        };
+        let parsed = base.with_http_selectors(Some("get"), Some("/predict"), Some(1));
+        assert!(parsed.is_err(), "mismatched path and hash should fail");
+    }
+
+    #[test]
+    fn labels_proto_and_cgroup_for_observability() {
+        assert_eq!(cgroup_id_label(167_838_211), "167838211");
         assert_eq!(proto_label(0), "*");
         assert_eq!(proto_label(6), "tcp");
         assert_eq!(proto_label(17), "udp");
@@ -325,7 +404,7 @@ mod tests {
     #[test]
     fn builds_normalized_flow_key() {
         let tenant = TenantKey {
-            src_ip: 167_838_211,
+            cgroup_id: 167_838_211,
             http_path_hash: 0x1234_abcd,
             dst_port: 443,
             proto: 6,
@@ -333,7 +412,7 @@ mod tests {
         };
         assert_eq!(
             normalized_flow_key(tenant),
-            "src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=0x1234abcd"
+            "cgroup=167838211|proto=tcp|dport=443|method=*|path_hash=0x1234abcd"
         );
     }
 

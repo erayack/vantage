@@ -12,6 +12,8 @@ use vantage_common::{
 
 const GLOBAL_STATS_INDEX: u32 = 0;
 const GLOBAL_CONFIG_INDEX: u32 = 0;
+const POLICY_MAP_NAME: &str = "POLICY_MAP";
+const RUNTIME_POLICY_MAP_NAME: &str = "RUNTIME_POLICY_MAP";
 
 #[derive(Debug, Error)]
 pub enum MapError {
@@ -29,12 +31,23 @@ pub struct ResolvedPolicy {
     pub matched: TenantKey,
     pub match_level: PolicyMatchLevel,
     pub policy: Policy,
+    pub source: PolicySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySource {
+    RuntimeOverride,
+    Base,
 }
 
 pub(crate) trait MapOps: Send + Sync {
     fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError>;
     fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
     fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
+    fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError>;
+    fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
+    fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError>;
     fn read_global_stats(&self) -> Result<GlobalStats, MapError>;
     fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError>;
@@ -92,19 +105,64 @@ impl MapClient {
         self.inner.get_policy(tenant)
     }
 
+    /// Inserts or updates a runtime override policy entry for a tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map write fails.
+    pub fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+        self.inner.upsert_runtime_policy(tenant, policy)
+    }
+
+    /// Removes a runtime override policy entry for a tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map delete fails.
+    pub fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+        self.inner.delete_runtime_policy(tenant)
+    }
+
+    /// Reads an exact runtime override policy entry for a tenant key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
+    pub fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+        self.inner.get_runtime_policy(tenant)
+    }
+
     /// Resolves the effective policy for a tenant using precedence rules.
     ///
     /// Precedence order:
-    /// 1. exact `(src_ip, proto, dst_port, http_method, http_path_hash)`
-    /// 2. path wildcard `(src_ip, proto, dst_port, http_method, 0)`
-    /// 3. method+path wildcard `(src_ip, proto, dst_port, 0, 0)`
-    /// 4. L4/L7 wildcard `(src_ip, proto, 0, 0, 0)`
-    /// 5. full wildcard `(src_ip, 0, 0, 0, 0)`
+    /// 1. runtime policy fallback chain
+    /// 2. base policy fallback chain
     ///
     /// # Errors
     ///
     /// Returns `MapError` when map access fails.
     pub fn resolve_policy(&self, requested: TenantKey) -> Result<Option<ResolvedPolicy>, MapError> {
+        if let Some(resolved) =
+            Self::resolve_policy_from_chain(requested, PolicySource::RuntimeOverride, |tenant| {
+                self.get_runtime_policy(tenant)
+            })?
+        {
+            return Ok(Some(resolved));
+        }
+
+        Self::resolve_policy_from_chain(requested, PolicySource::Base, |tenant| {
+            self.get_policy(tenant)
+        })
+    }
+
+    fn resolve_policy_from_chain<F>(
+        requested: TenantKey,
+        source: PolicySource,
+        mut getter: F,
+    ) -> Result<Option<ResolvedPolicy>, MapError>
+    where
+        F: FnMut(TenantKey) -> Result<Option<Policy>, MapError>,
+    {
         let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
             fallback_policy_keys(requested);
         let candidates = [
@@ -122,7 +180,7 @@ impl MapClient {
             }
             prior = Some(candidate);
 
-            if let Some(policy) = self.get_policy(candidate)? {
+            if let Some(policy) = getter(candidate)? {
                 let level =
                     policy_match_level(requested, candidate).unwrap_or(PolicyMatchLevel::Exact);
                 return Ok(Some(ResolvedPolicy {
@@ -130,6 +188,7 @@ impl MapClient {
                     matched: candidate,
                     match_level: level,
                     policy,
+                    source,
                 }));
             }
         }
@@ -234,52 +293,33 @@ impl MapOps for EbpfMapOps {
     }
 
     fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
-        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
-        {
-            let map = ebpf
-                .map_mut("POLICY_MAP")
-                .ok_or(MapError::MissingMap("POLICY_MAP"))?;
-            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
-            policy_map.insert(tenant, policy, 0)?;
-        }
-        drop(ebpf);
-
-        Ok(())
+        self.upsert_policy_to_map(POLICY_MAP_NAME, tenant, policy)
     }
 
     fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
-        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
-        let remove_result = {
-            let map = ebpf
-                .map_mut("POLICY_MAP")
-                .ok_or(MapError::MissingMap("POLICY_MAP"))?;
-            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
-            match policy_map.remove(&tenant) {
-                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
-                Err(error) => Err(MapError::Map(error)),
-            }
-        };
-        drop(ebpf);
-        remove_result?;
-
-        Ok(())
+        self.delete_policy_from_map(POLICY_MAP_NAME, tenant)
     }
 
     fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
-        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
-        let read_result = {
-            let map = ebpf
-                .map_mut("POLICY_MAP")
-                .ok_or(MapError::MissingMap("POLICY_MAP"))?;
-            let policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
-            match policy_map.get(&tenant, 0) {
-                Ok(policy) => Ok(Some(policy)),
-                Err(aya::maps::MapError::KeyNotFound) => Ok(None),
-                Err(error) => Err(MapError::Map(error)),
-            }
-        };
-        drop(ebpf);
-        read_result
+        self.get_policy_from_map(POLICY_MAP_NAME, tenant)
+    }
+
+    fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+        self.upsert_policy_to_map(RUNTIME_POLICY_MAP_NAME, tenant, policy)
+    }
+
+    fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+        match self.delete_policy_from_map(RUNTIME_POLICY_MAP_NAME, tenant) {
+            Err(MapError::MissingMap(RUNTIME_POLICY_MAP_NAME)) => Ok(()),
+            other => other,
+        }
+    }
+
+    fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+        match self.get_policy_from_map(RUNTIME_POLICY_MAP_NAME, tenant) {
+            Err(MapError::MissingMap(RUNTIME_POLICY_MAP_NAME)) => Ok(None),
+            other => other,
+        }
     }
 
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
@@ -366,6 +406,70 @@ impl MapOps for EbpfMapOps {
     }
 }
 
+impl EbpfMapOps {
+    fn upsert_policy_to_map(
+        &self,
+        map_name: &'static str,
+        tenant: TenantKey,
+        policy: Policy,
+    ) -> Result<(), MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        {
+            let map = ebpf
+                .map_mut(map_name)
+                .ok_or(MapError::MissingMap(map_name))?;
+            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            policy_map.insert(tenant, policy, 0)?;
+        }
+        drop(ebpf);
+
+        Ok(())
+    }
+
+    fn delete_policy_from_map(
+        &self,
+        map_name: &'static str,
+        tenant: TenantKey,
+    ) -> Result<(), MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let remove_result = {
+            let map = ebpf
+                .map_mut(map_name)
+                .ok_or(MapError::MissingMap(map_name))?;
+            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            match policy_map.remove(&tenant) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+                Err(error) => Err(MapError::Map(error)),
+            }
+        };
+        drop(ebpf);
+        remove_result?;
+
+        Ok(())
+    }
+
+    fn get_policy_from_map(
+        &self,
+        map_name: &'static str,
+        tenant: TenantKey,
+    ) -> Result<Option<Policy>, MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let read_result = {
+            let map = ebpf
+                .map_mut(map_name)
+                .ok_or(MapError::MissingMap(map_name))?;
+            let policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            match policy_map.get(&tenant, 0) {
+                Ok(policy) => Ok(Some(policy)),
+                Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+                Err(error) => Err(MapError::Map(error)),
+            }
+        };
+        drop(ebpf);
+        read_result
+    }
+}
+
 fn read_global_config_or_default(
     global_config_map: &Array<&mut aya::maps::MapData, GlobalConfig>,
 ) -> Result<GlobalConfig, MapError> {
@@ -393,6 +497,7 @@ mod tests {
 
     struct FixtureMapOps {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
+        runtime_policies: Mutex<BTreeMap<TenantKey, Policy>>,
         counters: Vec<(TenantKey, Counters)>,
         global_stats: GlobalStats,
         global_config: Mutex<GlobalConfig>,
@@ -402,6 +507,7 @@ mod tests {
         fn with_data(counters: Vec<(TenantKey, Counters)>, global_stats: GlobalStats) -> Arc<Self> {
             Arc::new(Self {
                 policies: Mutex::new(BTreeMap::new()),
+                runtime_policies: Mutex::new(BTreeMap::new()),
                 counters,
                 global_stats,
                 global_config: Mutex::new(GlobalConfig {
@@ -433,6 +539,32 @@ mod tests {
         fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
             let policy = self
                 .policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .get(&tenant)
+                .copied();
+            Ok(policy)
+        }
+
+        fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            self.runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .insert(tenant, policy);
+            Ok(())
+        }
+
+        fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+            self.runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .remove(&tenant);
+            Ok(())
+        }
+
+        fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            let policy = self
+                .runtime_policies
                 .lock()
                 .map_err(|_| MapError::LockPoisoned)?
                 .get(&tenant)
@@ -534,7 +666,7 @@ mod tests {
     fn collect_counters_preserves_fixture_values() {
         let counters = vec![(
             TenantKey {
-                src_ip: 42,
+                cgroup_id: 42,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
@@ -558,7 +690,7 @@ mod tests {
         assert_eq!(
             collected[0].0,
             TenantKey {
-                src_ip: 42,
+                cgroup_id: 42,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
@@ -583,7 +715,7 @@ mod tests {
         };
 
         let key = TenantKey {
-            src_ip: 10,
+            cgroup_id: 10,
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
@@ -673,21 +805,21 @@ mod tests {
         let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
         let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
         let exact_key = TenantKey {
-            src_ip: 0x0a01_0203,
+            cgroup_id: 0x0a01_0203,
             http_path_hash: 0,
             proto: 6,
             dst_port: 443,
             http_method: 0,
         };
         let port_method_path_wildcard_key = TenantKey {
-            src_ip: exact_key.src_ip,
+            cgroup_id: exact_key.cgroup_id,
             http_path_hash: exact_key.http_path_hash,
             proto: exact_key.proto,
             dst_port: 0,
             http_method: 0,
         };
         let full_wildcard_key = TenantKey {
-            src_ip: exact_key.src_ip,
+            cgroup_id: exact_key.cgroup_id,
             http_path_hash: exact_key.http_path_hash,
             proto: 0,
             dst_port: 0,
@@ -714,6 +846,7 @@ mod tests {
         };
         assert_eq!(resolved_full.matched, full_wildcard_key);
         assert_eq!(resolved_full.match_level, PolicyMatchLevel::FullWildcard);
+        assert_eq!(resolved_full.source, PolicySource::Base);
 
         let upsert_port_method_path = maps.upsert_policy(
             port_method_path_wildcard_key,
@@ -741,6 +874,7 @@ mod tests {
             resolved_proto.match_level,
             PolicyMatchLevel::PortMethodPathWildcard
         );
+        assert_eq!(resolved_proto.source, PolicySource::Base);
 
         let upsert_exact = maps.upsert_policy(
             exact_key,
@@ -762,5 +896,66 @@ mod tests {
         };
         assert_eq!(resolved_exact.matched, exact_key);
         assert_eq!(resolved_exact.match_level, PolicyMatchLevel::Exact);
+        assert_eq!(resolved_exact.source, PolicySource::Base);
+    }
+
+    #[test]
+    fn resolve_policy_prefers_runtime_chain_before_base_chain() {
+        let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let requested_key = TenantKey {
+            cgroup_id: 0x0a01_0203,
+            http_path_hash: 0x00ab_cdef,
+            proto: 6,
+            dst_port: 443,
+            http_method: 1,
+        };
+        let runtime_full_wildcard_key = TenantKey {
+            cgroup_id: requested_key.cgroup_id,
+            http_path_hash: 0,
+            proto: 0,
+            dst_port: 0,
+            http_method: 0,
+        };
+        let base_exact_key = requested_key;
+
+        let upsert_runtime = maps.upsert_runtime_policy(
+            runtime_full_wildcard_key,
+            Policy {
+                rate_tokens_per_sec: 100,
+                burst_tokens: 10,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(
+            upsert_runtime.is_ok(),
+            "runtime wildcard insert should succeed"
+        );
+
+        let upsert_base_exact = maps.upsert_policy(
+            base_exact_key,
+            Policy {
+                rate_tokens_per_sec: 300,
+                burst_tokens: 30,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(
+            upsert_base_exact.is_ok(),
+            "base exact insert should succeed"
+        );
+
+        let resolved = maps.resolve_policy(requested_key);
+        let Ok(resolved) = resolved else {
+            panic!("policy resolution should succeed");
+        };
+        let Some(resolved) = resolved else {
+            panic!("runtime wildcard fallback should resolve before base exact");
+        };
+        assert_eq!(resolved.matched, runtime_full_wildcard_key);
+        assert_eq!(resolved.match_level, PolicyMatchLevel::FullWildcard);
+        assert_eq!(resolved.source, PolicySource::RuntimeOverride);
     }
 }

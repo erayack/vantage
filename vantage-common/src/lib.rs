@@ -3,7 +3,7 @@
 #[cfg(feature = "user")]
 use aya::Pod;
 
-/// Flow-aware identity key derived from L2/L3/L4 metadata plus optional
+/// Flow-aware identity key derived from cgroup identity plus optional
 /// userspace-provided HTTP path hash selector.
 ///
 /// No application payload fields are part of kernel-side key extraction.
@@ -14,7 +14,7 @@ use aya::Pod;
 #[cfg_attr(feature = "user", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantKey {
-    pub src_ip: u32,
+    pub cgroup_id: u64,
     pub http_path_hash: u32, // 0 => wildcard
     pub dst_port: u16,       // 0 => wildcard
     pub proto: u8,           // 0 => wildcard, 6 => TCP, 17 => UDP
@@ -57,11 +57,11 @@ pub enum PolicyMatchLevel {
 
 #[must_use]
 /// Builds deterministic policy fallback candidates in precedence order:
-/// 1. exact `(src_ip, proto, dst_port, http_method, http_path_hash)`
-/// 2. path wildcard `(src_ip, proto, dst_port, http_method, 0)`
-/// 3. method+path wildcard `(src_ip, proto, dst_port, 0, 0)`
-/// 4. L4/L7 wildcard `(src_ip, proto, 0, 0, 0)`
-/// 5. full wildcard `(src_ip, 0, 0, 0, 0)`
+/// 1. exact `(cgroup_id, proto, dst_port, http_method, http_path_hash)`
+/// 2. path wildcard `(cgroup_id, proto, dst_port, http_method, 0)`
+/// 3. method+path wildcard `(cgroup_id, proto, dst_port, 0, 0)`
+/// 4. L4/L7 wildcard `(cgroup_id, proto, 0, 0, 0)`
+/// 5. full wildcard `(cgroup_id, 0, 0, 0, 0)`
 pub const fn fallback_policy_keys(
     key: TenantKey,
 ) -> (
@@ -74,7 +74,7 @@ pub const fn fallback_policy_keys(
     let exact_key = key;
     let path_wildcard_key = if key.http_path_hash != 0 {
         Some(TenantKey {
-            src_ip: key.src_ip,
+            cgroup_id: key.cgroup_id,
             http_path_hash: 0,
             dst_port: key.dst_port,
             proto: key.proto,
@@ -85,7 +85,7 @@ pub const fn fallback_policy_keys(
     };
     let method_path_wildcard_key = if key.http_method != 0 || key.http_path_hash != 0 {
         Some(TenantKey {
-            src_ip: key.src_ip,
+            cgroup_id: key.cgroup_id,
             http_path_hash: 0,
             dst_port: key.dst_port,
             proto: key.proto,
@@ -97,7 +97,7 @@ pub const fn fallback_policy_keys(
     let port_method_path_wildcard_key =
         if key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
             Some(TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: key.proto,
@@ -109,7 +109,7 @@ pub const fn fallback_policy_keys(
     let full_wildcard_key =
         if key.proto != 0 || key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
             Some(TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
@@ -266,7 +266,7 @@ pub struct LockedGlobalStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlobalConfig {
     pub enabled: u8,        // 0 => bypass data path logic (fail-open)
-    pub flow_keys_live: u8, // 0 => legacy src-ip-only matching, 1 => flow-aware key matching
+    pub flow_keys_live: u8, // 0 => cgroup-only matching, 1 => flow-aware key matching
     pub _pad: [u8; 6],
 }
 
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn fallback_policy_keys_follow_deterministic_precedence() {
         let key = TenantKey {
-            src_ip: 0x0a00_0001,
+            cgroup_id: 0x0a00_0001,
             http_path_hash: 0x1234_abcd,
             dst_port: 443,
             proto: 6,
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(
             path,
             TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: key.dst_port,
                 proto: key.proto,
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(
             method_path,
             TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: key.dst_port,
                 proto: key.proto,
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(
             port_method_path,
             TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: key.proto,
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(
             full,
             TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,

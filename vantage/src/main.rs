@@ -319,6 +319,22 @@ mod tests {
             Ok(None)
         }
 
+        fn upsert_runtime_policy(
+            &self,
+            _tenant: TenantKey,
+            _policy: Policy,
+        ) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn delete_runtime_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_runtime_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            Ok(None)
+        }
+
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
             Ok(Vec::new())
         }

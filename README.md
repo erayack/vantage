@@ -80,7 +80,7 @@ FNV-1a (32-bit) and writes only numeric `http_path_hash` into policy-map keys:
 
 Policy precedence is explicit and enforced consistently across API and kernel data-path:
 
-`exact(src_ip, proto, dst_port, http_method, http_path_hash) > path_wildcard(src_ip, proto, dst_port, http_method, 0) > method_path_wildcard(src_ip, proto, dst_port, 0, 0) > port_method_path_wildcard(src_ip, proto, 0, 0, 0) > full_wildcard(src_ip, 0, 0, 0, 0)`
+`runtime_override:[exact(cgroup_id, proto, dst_port, http_method, http_path_hash) > path_wildcard(cgroup_id, proto, dst_port, http_method, 0) > method_path_wildcard(cgroup_id, proto, dst_port, 0, 0) > port_method_path_wildcard(cgroup_id, proto, 0, 0, 0) > full_wildcard(cgroup_id, 0, 0, 0, 0)] > base:[exact(cgroup_id, proto, dst_port, http_method, http_path_hash) > path_wildcard(cgroup_id, proto, dst_port, http_method, 0) > method_path_wildcard(cgroup_id, proto, dst_port, 0, 0) > port_method_path_wildcard(cgroup_id, proto, 0, 0, 0) > full_wildcard(cgroup_id, 0, 0, 0, 0)]`
 
 ## Quality Gate
 

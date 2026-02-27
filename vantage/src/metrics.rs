@@ -11,7 +11,7 @@ use vantage_common::{Counters, TenantKey};
 use crate::{
     MetricsState,
     map_client::{MapClient, MapError},
-    tenant::{normalized_flow_key, proto_label, src_ip_label},
+    tenant::{cgroup_id_label, normalized_flow_key, proto_label},
 };
 
 #[derive(Debug, Error)]
@@ -264,8 +264,8 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool)
             };
             let _ = writeln!(
                 payload,
-                "vantage_tenant_pass_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
-                src_ip_label(tenant.src_ip),
+                "vantage_tenant_pass_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
                 flow_key,
@@ -273,8 +273,8 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool)
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_drop_packets{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
-                src_ip_label(tenant.src_ip),
+                "vantage_tenant_drop_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
                 flow_key,
@@ -282,8 +282,8 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool)
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_pass_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
-                src_ip_label(tenant.src_ip),
+                "vantage_tenant_pass_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
                 flow_key,
@@ -291,8 +291,8 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool)
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_drop_bytes{{src_ip=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
-                src_ip_label(tenant.src_ip),
+                "vantage_tenant_drop_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
                 flow_key,
@@ -346,7 +346,7 @@ mod tests {
         let payload = append_counter_metrics(
             &[(
                 TenantKey {
-                    src_ip: 167_838_211,
+                    cgroup_id: 167_838_211,
                     http_path_hash: 0,
                     dst_port: 0,
                     proto: 0,
@@ -365,12 +365,12 @@ mod tests {
         let text = payload;
         assert!(
             text.contains(
-                "vantage_tenant_pass_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*|method=*|path_hash=*\"} 1\n"
+                "vantage_tenant_pass_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 1\n"
             )
         );
         assert!(
             text.contains(
-                "vantage_tenant_drop_packets{src_ip=\"10.1.2.3\",dst_port=\"*\",proto=\"*\",flow=\"src=10.1.2.3|proto=*|dport=*|method=*|path_hash=*\"} 2\n"
+                "vantage_tenant_drop_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 2\n"
             )
         );
         assert!(!text.contains("\\n"));
@@ -381,7 +381,7 @@ mod tests {
         let payload = append_counter_metrics(
             &[(
                 TenantKey {
-                    src_ip: 42,
+                    cgroup_id: 42,
                     http_path_hash: 0,
                     dst_port: 53,
                     proto: 17,
@@ -402,7 +402,7 @@ mod tests {
         assert!(text.contains("vantage_tenant_drop_packets 2\n"));
         assert!(text.contains("vantage_tenant_pass_bytes 3\n"));
         assert!(text.contains("vantage_tenant_drop_bytes 4\n"));
-        assert!(!text.contains("{src_ip="));
+        assert!(!text.contains("{cgroup_id="));
 
         let mut parsed_samples = 0_u32;
         for line in text.lines() {
@@ -433,7 +433,7 @@ mod tests {
             &[
                 (
                     TenantKey {
-                        src_ip: 1,
+                        cgroup_id: 1,
                         http_path_hash: 0,
                         dst_port: 80,
                         proto: 6,
@@ -448,7 +448,7 @@ mod tests {
                 ),
                 (
                     TenantKey {
-                        src_ip: 2,
+                        cgroup_id: 2,
                         http_path_hash: 0,
                         dst_port: 53,
                         proto: 17,

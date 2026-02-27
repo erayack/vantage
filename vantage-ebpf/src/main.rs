@@ -5,14 +5,17 @@ use aya_ebpf::{
     bindings::{
         BPF_F_NO_PREALLOC, BPF_NOEXIST, TC_ACT_OK, TC_ACT_SHOT, bpf_spin_lock as AyaBpfSpinLock,
     },
-    helpers::{bpf_ktime_get_ns, bpf_spin_lock as bpf_helper_spin_lock, bpf_spin_unlock},
+    helpers::{
+        bpf_ktime_get_ns, bpf_skb_cgroup_id, bpf_spin_lock as bpf_helper_spin_lock, bpf_spin_unlock,
+    },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::TcContext,
 };
 use vantage_common::{
-    Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, KERNEL_DROP_EVENT_SAMPLE_EVERY,
-    LockedTokenState, Policy, TenantKey, TokenState, fallback_policy_keys,
+    Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, HTTP_METHOD_ANY, HTTP_METHOD_GET,
+    HTTP_METHOD_POST, KERNEL_DROP_EVENT_SAMPLE_EVERY, LockedTokenState, Policy, TenantKey,
+    TokenState, fallback_policy_keys,
 };
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
@@ -29,16 +32,26 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_VERSION: u8 = 4;
 const IPV4_VERSION_IHL_REL_OFFSET: usize = 0;
 const IPV4_PROTOCOL_REL_OFFSET: usize = 9;
-const IPV4_SRC_ADDR_REL_OFFSET: usize = 12;
 const L4_DST_PORT_REL_OFFSET: usize = 2;
+const TCP_DATA_OFFSET_REL_OFFSET: usize = 12;
+const TCP_MIN_HEADER_LEN: usize = 20;
+const UDP_HEADER_LEN: usize = 8;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const HTTP_PREFIX_MAX_BYTES: usize = 128;
+const HTTP_PATH_HASH_MAX_BYTES: usize = 64;
+const FNV1A_OFFSET_BASIS: u32 = 0x811c_9dc5;
+const FNV1A_PRIME: u32 = 0x0100_0193;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const HASH_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 const STATE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[map]
 static POLICY_MAP: HashMap<TenantKey, Policy> =
+    HashMap::<TenantKey, Policy>::with_max_entries(HASH_MAP_MAX_ENTRIES, HASH_MAP_FLAGS);
+
+#[map]
+static RUNTIME_POLICY_MAP: HashMap<TenantKey, Policy> =
     HashMap::<TenantKey, Policy>::with_max_entries(HASH_MAP_MAX_ENTRIES, HASH_MAP_FLAGS);
 
 #[map]
@@ -92,7 +105,7 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     };
 
-    let Some(policy) = read_policy_with_fallback(tenant_key) else {
+    let Some(policy) = read_policy_with_dual_fallback(tenant_key) else {
         update_counters(tenant_key, pkt_len, true);
         update_global_stats(pkt_len, true, Some(DropReason::NoPolicy));
         return Ok(TC_ACT_OK);
@@ -132,14 +145,15 @@ fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
 }
 
 fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantKey> {
+    let cgroup_id = extract_cgroup_id(ctx)?;
     let packet_len = usize::try_from(ctx.len()).ok()?;
-    // Parser contract: keep kernel reads bounded to L2/L3/L4 headers only.
-    // Do not inspect application payload from this path.
+    // Parser contract: all kernel packet reads are bounded.
+    // L7 reads only inspect a small fixed payload prefix.
     let l3_offset = parse_l2_ipv4(ctx, packet_len)?;
-    let (proto, src_ip, l4_offset) = parse_l3_ipv4(ctx, packet_len, l3_offset)?;
+    let (proto, l4_offset) = parse_l3_ipv4(ctx, packet_len, l3_offset)?;
     if !flow_keys_live {
         return Some(TenantKey {
-            src_ip,
+            cgroup_id,
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
@@ -148,14 +162,27 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
     }
 
     let dst_port = parse_l4_dst_port(ctx, packet_len, proto, l4_offset)?;
+    let (http_method, http_path_hash) = parse_l7_http_selector(ctx, packet_len, proto, l4_offset);
 
     Some(TenantKey {
-        src_ip,
-        http_path_hash: 0,
+        cgroup_id,
+        http_path_hash,
         dst_port,
         proto,
-        http_method: 0,
+        http_method,
     })
+}
+
+#[allow(unsafe_code)]
+fn extract_cgroup_id(ctx: &TcContext) -> Option<u64> {
+    // SAFETY: Helper reads cgroup id from skb context; pointer comes directly
+    // from kernel-provided `TcContext`.
+    let cgroup_id = unsafe { bpf_skb_cgroup_id(ctx.skb.skb) };
+    if cgroup_id == 0 {
+        None
+    } else {
+        Some(cgroup_id)
+    }
 }
 
 fn parse_l2_ipv4(ctx: &TcContext, packet_len: usize) -> Option<usize> {
@@ -173,7 +200,7 @@ fn parse_l2_ipv4(ctx: &TcContext, packet_len: usize) -> Option<usize> {
     Some(ETHERNET_HEADER_LEN)
 }
 
-fn parse_l3_ipv4(ctx: &TcContext, packet_len: usize, l3_offset: usize) -> Option<(u8, u32, usize)> {
+fn parse_l3_ipv4(ctx: &TcContext, packet_len: usize, l3_offset: usize) -> Option<(u8, usize)> {
     if packet_len < l3_offset + IPV4_MIN_HEADER_LEN {
         return None;
     }
@@ -196,9 +223,8 @@ fn parse_l3_ipv4(ctx: &TcContext, packet_len: usize, l3_offset: usize) -> Option
     }
 
     let proto = ctx.load::<u8>(l3_offset + IPV4_PROTOCOL_REL_OFFSET).ok()?;
-    let src_ip = ctx.load::<u32>(l3_offset + IPV4_SRC_ADDR_REL_OFFSET).ok()?;
     let l4_offset = l3_offset + ip_header_len;
-    Some((proto, u32::from_be(src_ip), l4_offset))
+    Some((proto, l4_offset))
 }
 
 fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> bool {
@@ -225,13 +251,20 @@ fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> b
 }
 
 #[allow(unsafe_code)]
-fn read_policy(key: TenantKey) -> Option<Policy> {
+fn read_base_policy(key: TenantKey) -> Option<Policy> {
     // SAFETY: The map value is copied out immediately and never held across
     // helper calls, avoiding aliasing/lifetime pitfalls of raw map pointers.
     unsafe { POLICY_MAP.get(&key).copied() }
 }
 
-fn read_policy_with_fallback(key: TenantKey) -> Option<Policy> {
+#[allow(unsafe_code)]
+fn read_runtime_policy(key: TenantKey) -> Option<Policy> {
+    // SAFETY: The map value is copied out immediately and never held across
+    // helper calls, avoiding aliasing/lifetime pitfalls of raw map pointers.
+    unsafe { RUNTIME_POLICY_MAP.get(&key).copied() }
+}
+
+fn read_runtime_policy_with_fallback(key: TenantKey) -> Option<Policy> {
     let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
         fallback_policy_keys(key);
     let candidates = [
@@ -249,12 +282,42 @@ fn read_policy_with_fallback(key: TenantKey) -> Option<Policy> {
         }
         prior = Some(candidate);
 
-        if let Some(policy) = read_policy(candidate) {
+        if let Some(policy) = read_runtime_policy(candidate) {
             return Some(policy);
         }
     }
 
     None
+}
+
+fn read_base_policy_with_fallback(key: TenantKey) -> Option<Policy> {
+    let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
+        fallback_policy_keys(key);
+    let candidates = [
+        Some(exact),
+        path_wildcard,
+        method_path_wildcard,
+        port_method_path_wildcard,
+        full_wildcard,
+    ];
+    let mut prior: Option<TenantKey> = None;
+
+    for candidate in candidates.into_iter().flatten() {
+        if prior == Some(candidate) {
+            continue;
+        }
+        prior = Some(candidate);
+
+        if let Some(policy) = read_base_policy(candidate) {
+            return Some(policy);
+        }
+    }
+
+    None
+}
+
+fn read_policy_with_dual_fallback(key: TenantKey) -> Option<Policy> {
+    read_runtime_policy_with_fallback(key).or_else(|| read_base_policy_with_fallback(key))
 }
 
 #[allow(unsafe_code)]
@@ -479,6 +542,118 @@ fn parse_l4_dst_port_value(
     Some(u16::from_be(dst_port_be?))
 }
 
+fn parse_l7_http_selector(
+    ctx: &TcContext,
+    packet_len: usize,
+    proto: u8,
+    l4_offset: usize,
+) -> (u8, u32) {
+    let Some(payload_offset) = parse_l7_payload_offset(ctx, packet_len, proto, l4_offset) else {
+        return (HTTP_METHOD_ANY, 0);
+    };
+
+    let mut prefix = [0_u8; HTTP_PREFIX_MAX_BYTES];
+    let Ok(read_len) = ctx.load_bytes(payload_offset, &mut prefix) else {
+        return (HTTP_METHOD_ANY, 0);
+    };
+    if read_len == 0 {
+        return (HTTP_METHOD_ANY, 0);
+    }
+
+    parse_http_method_and_path_hash(&prefix, read_len).unwrap_or((HTTP_METHOD_ANY, 0))
+}
+
+fn parse_l7_payload_offset(
+    ctx: &TcContext,
+    packet_len: usize,
+    proto: u8,
+    l4_offset: usize,
+) -> Option<usize> {
+    if proto == IPPROTO_TCP {
+        return parse_tcp_payload_offset(ctx, packet_len, l4_offset);
+    }
+
+    if proto == IPPROTO_UDP {
+        let payload_offset = l4_offset.checked_add(UDP_HEADER_LEN)?;
+        if packet_len < payload_offset {
+            return None;
+        }
+        return Some(payload_offset);
+    }
+
+    None
+}
+
+fn parse_tcp_payload_offset(ctx: &TcContext, packet_len: usize, l4_offset: usize) -> Option<usize> {
+    if packet_len < l4_offset + TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let data_offset_byte = ctx
+        .load::<u8>(l4_offset + TCP_DATA_OFFSET_REL_OFFSET)
+        .ok()?;
+    let data_offset_words = data_offset_byte >> 4;
+    if data_offset_words < 5 {
+        return None;
+    }
+    let tcp_header_len = usize::from(data_offset_words) * 4;
+    let payload_offset = l4_offset.checked_add(tcp_header_len)?;
+    if packet_len < payload_offset {
+        return None;
+    }
+    Some(payload_offset)
+}
+
+fn parse_http_method_and_path_hash(
+    prefix: &[u8; HTTP_PREFIX_MAX_BYTES],
+    read_len: usize,
+) -> Option<(u8, u32)> {
+    if read_len < 5 {
+        return None;
+    }
+
+    let (http_method, path_start) = if prefix.starts_with(b"GET ") {
+        (HTTP_METHOD_GET, 4_usize)
+    } else if read_len >= 6 && prefix.starts_with(b"POST ") {
+        (HTTP_METHOD_POST, 5_usize)
+    } else {
+        return None;
+    };
+
+    parse_http_path_hash(prefix, read_len, path_start).map(|hash| (http_method, hash))
+}
+
+fn parse_http_path_hash(
+    prefix: &[u8; HTTP_PREFIX_MAX_BYTES],
+    read_len: usize,
+    path_start: usize,
+) -> Option<u32> {
+    if path_start >= read_len {
+        return None;
+    }
+    if prefix[path_start] != b'/' {
+        return None;
+    }
+
+    let mut hash = FNV1A_OFFSET_BASIS;
+    let mut seen_any = false;
+    let mut idx = 0_usize;
+    while idx < HTTP_PATH_HASH_MAX_BYTES {
+        let pos = path_start.checked_add(idx)?;
+        if pos >= read_len {
+            return None;
+        }
+        let byte = prefix[pos];
+        if byte == b' ' {
+            return seen_any.then_some(hash);
+        }
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+        seen_any = true;
+        idx += 1;
+    }
+    None
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
@@ -550,7 +725,7 @@ mod tests {
     #[test]
     fn fallback_policy_keys_use_exact_then_path_then_port_method_path_then_full_wildcard() {
         let key = TenantKey {
-            src_ip: 0x0a00_0001,
+            cgroup_id: 0x0a00_0001,
             http_path_hash: 0x1234,
             dst_port: 443,
             proto: IPPROTO_TCP,
@@ -565,7 +740,7 @@ mod tests {
         assert_eq!(
             path_wildcard,
             Some(TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: key.dst_port,
                 proto: IPPROTO_TCP,
@@ -575,7 +750,7 @@ mod tests {
         assert_eq!(
             port_method_path_wildcard,
             Some(TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: IPPROTO_TCP,
@@ -585,7 +760,7 @@ mod tests {
         assert_eq!(
             full_wildcard,
             Some(TenantKey {
-                src_ip: key.src_ip,
+                cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
@@ -597,7 +772,7 @@ mod tests {
     #[test]
     fn fallback_policy_keys_skip_wildcards_when_key_is_already_wildcard() {
         let key = TenantKey {
-            src_ip: 0x0a00_0001,
+            cgroup_id: 0x0a00_0001,
             http_path_hash: 0,
             dst_port: 0,
             proto: 0,
@@ -639,6 +814,37 @@ mod tests {
         let packet_len = l4_offset;
         let parsed = parse_l4_dst_port_value(1, packet_len, l4_offset, None);
         assert_eq!(parsed, Some(0));
+    }
+
+    #[test]
+    fn parses_http_get_path_hash() {
+        let mut prefix = [0_u8; HTTP_PREFIX_MAX_BYTES];
+        let req = b"GET /predict HTTP/1.1";
+        prefix[..req.len()].copy_from_slice(req);
+        let parsed = parse_http_method_and_path_hash(&prefix, req.len());
+        assert_eq!(parsed, Some((HTTP_METHOD_GET, 0xefb2_d4b7)));
+    }
+
+    #[test]
+    fn parses_http_post_path_hash() {
+        let mut prefix = [0_u8; HTTP_PREFIX_MAX_BYTES];
+        let req = b"POST /score HTTP/1.1";
+        prefix[..req.len()].copy_from_slice(req);
+        let parsed = parse_http_method_and_path_hash(&prefix, req.len());
+        assert_eq!(parsed, Some((HTTP_METHOD_POST, 0xf7bd_07cc)));
+    }
+
+    #[test]
+    fn rejects_non_http_prefix_and_missing_space() {
+        let mut prefix = [0_u8; HTTP_PREFIX_MAX_BYTES];
+        let req = b"PRI * HTTP/2.0";
+        prefix[..req.len()].copy_from_slice(req);
+        assert_eq!(parse_http_method_and_path_hash(&prefix, req.len()), None);
+
+        let mut prefix2 = [0_u8; HTTP_PREFIX_MAX_BYTES];
+        let req2 = b"GET /predict";
+        prefix2[..req2.len()].copy_from_slice(req2);
+        assert_eq!(parse_http_method_and_path_hash(&prefix2, req2.len()), None);
     }
 
     #[derive(Default)]

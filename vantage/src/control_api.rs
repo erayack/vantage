@@ -11,9 +11,11 @@ use vantage_common::{Counters, GlobalStats, Policy, PolicyMatchLevel, ReasonBuck
 
 use crate::{
     AppState,
-    map_client::{MapError, ResolvedPolicy},
+    map_client::{MapError, PolicySource, ResolvedPolicy},
     metrics::{CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async},
-    tenant::{FlowProto, TenantParseError, TenantRef, compute_http_path_hash, normalized_flow_key},
+    tenant::{
+        FlowProto, TenantParseError, TenantRef, http_method_label, normalized_flow_key, proto_label,
+    },
 };
 
 const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -25,6 +27,7 @@ pub(crate) struct PutPolicyRequest {
     pub enabled: bool,
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_method: Option<String>,
     pub http_path: Option<String>,
     pub http_path_hash: Option<u32>,
 }
@@ -38,6 +41,7 @@ pub(crate) struct PutEnabledRequest {
 pub(crate) struct DeletePolicyQuery {
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_method: Option<String>,
     pub http_path: Option<String>,
     pub http_path_hash: Option<u32>,
 }
@@ -46,6 +50,7 @@ pub(crate) struct DeletePolicyQuery {
 pub(crate) struct ResolvePolicyQuery {
     pub proto: Option<String>,
     pub dst_port: Option<u16>,
+    pub http_method: Option<String>,
     pub http_path: Option<String>,
     pub http_path_hash: Option<u32>,
 }
@@ -76,7 +81,10 @@ impl From<Policy> for PolicyView {
 pub(crate) struct ResolvedPolicyView {
     pub requested: TenantKey,
     pub matched: TenantKey,
+    pub requested_selector: SelectorView,
+    pub matched_selector: SelectorView,
     pub match_level: PolicyMatchLevel,
+    pub source: PolicySource,
     pub requested_flow: String,
     pub matched_flow: String,
     pub policy: PolicyView,
@@ -87,7 +95,10 @@ impl From<ResolvedPolicy> for ResolvedPolicyView {
         Self {
             requested: resolved.requested,
             matched: resolved.matched,
+            requested_selector: SelectorView::from_tenant(resolved.requested),
+            matched_selector: SelectorView::from_tenant(resolved.matched),
             match_level: resolved.match_level,
+            source: resolved.source,
             requested_flow: normalized_flow_key(resolved.requested),
             matched_flow: normalized_flow_key(resolved.matched),
             policy: resolved.policy.into(),
@@ -99,6 +110,7 @@ impl From<ResolvedPolicy> for ResolvedPolicyView {
 pub(crate) struct PolicyUpsertResponse {
     pub stored: TenantKey,
     pub scope: PolicyMatchLevel,
+    pub stored_selector: SelectorView,
     pub stored_flow: String,
     pub precedence: &'static str,
     pub effective_for_stored: ResolvedPolicyView,
@@ -109,6 +121,7 @@ pub(crate) struct PolicyUpsertResponse {
 pub(crate) struct PolicyDeleteResponse {
     pub deleted: bool,
     pub deleted_key: TenantKey,
+    pub deleted_selector: SelectorView,
     pub deleted_flow: String,
     pub precedence: &'static str,
     pub effective_after_delete: Option<ResolvedPolicyView>,
@@ -117,9 +130,34 @@ pub(crate) struct PolicyDeleteResponse {
 #[derive(Debug, Serialize)]
 pub(crate) struct ResolvePolicyResponse {
     pub requested: TenantKey,
+    pub requested_selector: SelectorView,
     pub requested_flow: String,
     pub precedence: &'static str,
     pub effective: Option<ResolvedPolicyView>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SelectorView {
+    pub proto: &'static str,
+    pub dst_port: Option<u16>,
+    pub http_method: &'static str,
+    pub http_path_hash: Option<u32>,
+    pub http_path_hash_hex: Option<String>,
+    pub normalized: String,
+}
+
+impl SelectorView {
+    fn from_tenant(tenant: TenantKey) -> Self {
+        let http_path_hash = (tenant.http_path_hash != 0).then_some(tenant.http_path_hash);
+        Self {
+            proto: proto_label(tenant.proto),
+            dst_port: (tenant.dst_port != 0).then_some(tenant.dst_port),
+            http_method: http_method_label(tenant.http_method),
+            http_path_hash,
+            http_path_hash_hex: http_path_hash.map(|hash| format!("{hash:#010x}")),
+            normalized: normalized_flow_key(tenant),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -218,10 +256,13 @@ pub(crate) async fn put_policy(
     Json(req): Json<PutPolicyRequest>,
 ) -> Result<Json<PolicyUpsertResponse>, ApiError> {
     let proto = parse_proto(req.proto.as_deref())?;
-    let http_path_hash = parse_http_path_hash(req.http_path.as_deref(), req.http_path_hash)?;
     let tenant = TenantRef::parse(&tenant)?
         .with_flow(proto, req.dst_port)?
-        .with_http_path_hash(http_path_hash)
+        .with_http_selectors(
+            req.http_method.as_deref(),
+            req.http_path.as_deref(),
+            req.http_path_hash,
+        )?
         .to_tenant_key();
     let mut warnings = Vec::new();
     if partial_l7_policy_key(tenant) {
@@ -247,18 +288,25 @@ pub(crate) async fn put_policy(
         _pad: [0; 7],
     };
     maps.upsert_policy(tenant, policy)?;
-    let effective_for_stored = ResolvedPolicyView {
-        requested: tenant,
-        matched: tenant,
-        match_level: PolicyMatchLevel::Exact,
-        requested_flow: normalized_flow_key(tenant),
-        matched_flow: normalized_flow_key(tenant),
-        policy: policy.into(),
-    };
+    let effective_for_stored = maps.resolve_policy(tenant)?.map_or_else(
+        || ResolvedPolicyView {
+            requested: tenant,
+            matched: tenant,
+            requested_selector: SelectorView::from_tenant(tenant),
+            matched_selector: SelectorView::from_tenant(tenant),
+            match_level: PolicyMatchLevel::Exact,
+            source: PolicySource::Base,
+            requested_flow: normalized_flow_key(tenant),
+            matched_flow: normalized_flow_key(tenant),
+            policy: policy.into(),
+        },
+        Into::into,
+    );
 
     Ok(Json(PolicyUpsertResponse {
         stored: tenant,
         scope: policy_scope_from_key(tenant),
+        stored_selector: SelectorView::from_tenant(tenant),
         stored_flow: normalized_flow_key(tenant),
         precedence: policy_precedence_contract(),
         effective_for_stored,
@@ -302,10 +350,13 @@ pub(crate) async fn delete_policy(
     State(app): State<AppState>,
 ) -> Result<Json<PolicyDeleteResponse>, ApiError> {
     let proto = parse_proto(query.proto.as_deref())?;
-    let http_path_hash = parse_http_path_hash(query.http_path.as_deref(), query.http_path_hash)?;
     let tenant = TenantRef::parse(&tenant)?
         .with_flow(proto, query.dst_port)?
-        .with_http_path_hash(http_path_hash)
+        .with_http_selectors(
+            query.http_method.as_deref(),
+            query.http_path.as_deref(),
+            query.http_path_hash,
+        )?
         .to_tenant_key();
     let maps = app.maps;
     let deleted = maps.get_policy(tenant)?.is_some();
@@ -315,6 +366,7 @@ pub(crate) async fn delete_policy(
     Ok(Json(PolicyDeleteResponse {
         deleted,
         deleted_key: tenant,
+        deleted_selector: SelectorView::from_tenant(tenant),
         deleted_flow: normalized_flow_key(tenant),
         precedence: policy_precedence_contract(),
         effective_after_delete: effective_after_delete.map(Into::into),
@@ -332,15 +384,19 @@ pub(crate) async fn resolve_policy(
     State(app): State<AppState>,
 ) -> Result<Json<ResolvePolicyResponse>, ApiError> {
     let proto = parse_proto(query.proto.as_deref())?;
-    let http_path_hash = parse_http_path_hash(query.http_path.as_deref(), query.http_path_hash)?;
     let requested = TenantRef::parse(&tenant)?
         .with_flow(proto, query.dst_port)?
-        .with_http_path_hash(http_path_hash)
+        .with_http_selectors(
+            query.http_method.as_deref(),
+            query.http_path.as_deref(),
+            query.http_path_hash,
+        )?
         .to_tenant_key();
     let effective = app.maps.resolve_policy(requested)?;
 
     Ok(Json(ResolvePolicyResponse {
         requested,
+        requested_selector: SelectorView::from_tenant(requested),
         requested_flow: normalized_flow_key(requested),
         precedence: policy_precedence_contract(),
         effective: effective.map(Into::into),
@@ -416,23 +472,8 @@ fn parse_proto(proto: Option<&str>) -> Result<Option<FlowProto>, TenantParseErro
     }
 }
 
-fn parse_http_path_hash(
-    http_path: Option<&str>,
-    explicit_hash: Option<u32>,
-) -> Result<Option<u32>, TenantParseError> {
-    let computed_hash = http_path.map(compute_http_path_hash);
-    match (computed_hash, explicit_hash) {
-        (Some(computed), Some(explicit)) if computed != explicit => {
-            Err(TenantParseError::PathHashMismatch)
-        }
-        (Some(computed), _) => Ok(Some(computed)),
-        (None, Some(explicit)) => Ok(Some(explicit)),
-        (None, None) => Ok(None),
-    }
-}
-
 const fn policy_precedence_contract() -> &'static str {
-    "exact(src_ip,proto,dst_port,http_method,http_path_hash) > path_wildcard(src_ip,proto,dst_port,http_method,0) > method_path_wildcard(src_ip,proto,dst_port,0,0) > port_method_path_wildcard(src_ip,proto,0,0,0) > full_wildcard(src_ip,0,0,0,0)"
+    "runtime_override:[exact(cgroup_id,proto,dst_port,http_method,http_path_hash) > path_wildcard(cgroup_id,proto,dst_port,http_method,0) > method_path_wildcard(cgroup_id,proto,dst_port,0,0) > port_method_path_wildcard(cgroup_id,proto,0,0,0) > full_wildcard(cgroup_id,0,0,0,0)] > base:[exact(cgroup_id,proto,dst_port,http_method,http_path_hash) > path_wildcard(cgroup_id,proto,dst_port,http_method,0) > method_path_wildcard(cgroup_id,proto,dst_port,0,0) > port_method_path_wildcard(cgroup_id,proto,0,0,0) > full_wildcard(cgroup_id,0,0,0,0)]"
 }
 
 const PARTIAL_L7_POLICY_WARNING: &str = "partial L7 policy accepted with wildcard L4 selectors; set proto and dst_port for strict specificity";
@@ -520,6 +561,7 @@ mod tests {
 
     struct InMemoryMapOps {
         policies: Mutex<BTreeMap<TenantKey, Policy>>,
+        runtime_policies: Mutex<BTreeMap<TenantKey, Policy>>,
         counters: Vec<(TenantKey, Counters)>,
         global_stats: GlobalStats,
         global_enabled: Mutex<bool>,
@@ -530,6 +572,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 policies: Mutex::new(BTreeMap::new()),
+                runtime_policies: Mutex::new(BTreeMap::new()),
                 counters: Vec::new(),
                 global_stats: Self::default_global_stats(),
                 global_enabled: Mutex::new(true),
@@ -572,6 +615,32 @@ mod tests {
         fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
             let policy = self
                 .policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .get(&tenant)
+                .copied();
+            Ok(policy)
+        }
+
+        fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            self.runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .insert(tenant, policy);
+            Ok(())
+        }
+
+        fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+            self.runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .remove(&tenant);
+            Ok(())
+        }
+
+        fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            let policy = self
+                .runtime_policies
                 .lock()
                 .map_err(|_| MapError::LockPoisoned)?
                 .get(&tenant)
@@ -708,10 +777,11 @@ mod tests {
         };
         MapClient::from_ops(Arc::new(InMemoryMapOps {
             policies: Mutex::new(BTreeMap::new()),
+            runtime_policies: Mutex::new(BTreeMap::new()),
             counters: vec![
                 (
                     TenantKey {
-                        src_ip: 167_838_211,
+                        cgroup_id: 167_838_211,
                         http_path_hash: 0,
                         dst_port: 443,
                         proto: 6,
@@ -726,7 +796,7 @@ mod tests {
                 ),
                 (
                     TenantKey {
-                        src_ip: 167_838_212,
+                        cgroup_id: 167_838_212,
                         http_path_hash: 0,
                         dst_port: 53,
                         proto: 17,
@@ -773,9 +843,10 @@ mod tests {
     fn metrics_fixture_maps() -> MapClient {
         MapClient::from_ops(Arc::new(InMemoryMapOps {
             policies: Mutex::new(BTreeMap::new()),
+            runtime_policies: Mutex::new(BTreeMap::new()),
             counters: vec![(
                 TenantKey {
-                    src_ip: 167_838_211,
+                    cgroup_id: 167_838_211,
                     http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
@@ -828,20 +899,26 @@ mod tests {
         };
         assert_eq!(
             payload["precedence"],
-            serde_json::json!(
-                "exact(src_ip,proto,dst_port,http_method,http_path_hash) > path_wildcard(src_ip,proto,dst_port,http_method,0) > method_path_wildcard(src_ip,proto,dst_port,0,0) > port_method_path_wildcard(src_ip,proto,0,0,0) > full_wildcard(src_ip,0,0,0,0)"
-            )
+            serde_json::json!(super::policy_precedence_contract())
         );
         assert_eq!(payload["scope"], serde_json::json!("full_wildcard"));
         assert_eq!(
             payload["effective_for_stored"]["match_level"],
             serde_json::json!("exact")
         );
+        assert_eq!(
+            payload["stored_selector"]["normalized"],
+            serde_json::json!("cgroup=42|proto=*|dport=*|method=*|path_hash=*")
+        );
+        assert_eq!(
+            payload["stored_selector"]["http_path_hash"],
+            serde_json::json!(null)
+        );
         assert_eq!(payload["warnings"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn put_policy_accepts_canonical_ip_tenant() {
+    async fn put_policy_accepts_canonical_cgroup_tenant() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
             .route("/policy/:tenant", put(put_policy).delete(delete_policy))
@@ -849,7 +926,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
@@ -866,7 +943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_policy_accepts_bare_ipv4_tenant() {
+    async fn put_policy_accepts_bare_cgroup_id_tenant() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
             .route("/policy/:tenant", put(put_policy).delete(delete_policy))
@@ -874,7 +951,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/10.1.2.3")
+            .uri("/policy/167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
@@ -925,7 +1002,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443}"#,
@@ -943,7 +1020,7 @@ mod tests {
         match fixture.policies.lock() {
             Ok(policies) => {
                 let tenant = TenantKey {
-                    src_ip: 167_838_211,
+                    cgroup_id: 167_838_211,
                     http_path_hash: 0,
                     dst_port: 443,
                     proto: 6,
@@ -970,7 +1047,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_path":"/predict"}"#,
@@ -984,11 +1061,31 @@ mod tests {
             Err(error) => match error {},
         };
         assert_eq!(resp.status(), StatusCode::OK);
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(
+            payload["stored_selector"]["http_path_hash"],
+            serde_json::json!(compute_http_path_hash("/predict"))
+        );
+        assert_eq!(
+            payload["stored_selector"]["http_path_hash_hex"],
+            serde_json::json!(format!("{:#010x}", compute_http_path_hash("/predict")))
+        );
+        assert_eq!(
+            payload["stored_selector"]["http_method"],
+            serde_json::json!("*")
+        );
 
         match fixture.policies.lock() {
             Ok(policies) => {
                 let tenant = TenantKey {
-                    src_ip: 167_838_211,
+                    cgroup_id: 167_838_211,
                     http_path_hash: compute_http_path_hash("/predict"),
                     dst_port: 443,
                     proto: 6,
@@ -1006,6 +1103,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_policy_accepts_http_method_and_path_selectors() {
+        let fixture = Arc::new(InMemoryMapOps::new());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/cg:167838211")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_method":"post","http_path":"/predict"}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(
+            payload["stored_selector"]["http_path_hash"],
+            serde_json::json!(compute_http_path_hash("/predict"))
+        );
+        assert_eq!(
+            payload["stored_selector"]["http_path_hash_hex"],
+            serde_json::json!(format!("{:#010x}", compute_http_path_hash("/predict")))
+        );
+        assert_eq!(
+            payload["stored_selector"]["http_method"],
+            serde_json::json!("post")
+        );
+
+        match fixture.policies.lock() {
+            Ok(policies) => {
+                let tenant = TenantKey {
+                    cgroup_id: 167_838_211,
+                    http_path_hash: compute_http_path_hash("/predict"),
+                    dst_port: 443,
+                    proto: 6,
+                    http_method: 2,
+                };
+                assert!(
+                    policies.contains_key(&tenant),
+                    "policy key should include normalized http method and path hash selectors"
+                );
+            }
+            Err(error) => {
+                panic!("fixture lock should not be poisoned: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_policy_response_reports_runtime_override_as_effective() {
+        let fixture = Arc::new(InMemoryMapOps::new());
+        let tenant = TenantKey {
+            cgroup_id: 167_838_211,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        {
+            let Ok(mut runtime_policies) = fixture.runtime_policies.lock() else {
+                panic!("fixture lock should not be poisoned");
+            };
+            runtime_policies.insert(
+                tenant,
+                Policy {
+                    rate_tokens_per_sec: 10,
+                    burst_tokens: 5,
+                    enabled: 1,
+                    _pad: [0; 7],
+                },
+            );
+        }
+
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/cg:167838211")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(
+            payload["effective_for_stored"]["source"],
+            serde_json::json!("runtime_override")
+        );
+        assert_eq!(
+            payload["effective_for_stored"]["policy"]["rate_tokens_per_sec"],
+            serde_json::json!(10)
+        );
+    }
+
+    #[tokio::test]
     async fn put_policy_warns_on_partial_l7_in_permissive_mode() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
@@ -1014,7 +1240,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"http_path":"/predict"}"#,
@@ -1054,7 +1280,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"http_path":"/predict"}"#,
@@ -1089,10 +1315,35 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_path":"/predict","http_path_hash":1}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_policy_rejects_invalid_http_method() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(test_state(maps));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/cg:167838211")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443,"http_method":"trace"}"#,
             ));
         let Ok(request) = req else {
             panic!("request should build");
@@ -1114,7 +1365,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"udp"}"#,
@@ -1139,7 +1390,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"dst_port":53}"#,
@@ -1164,7 +1415,7 @@ mod tests {
 
         let req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"icmp","dst_port":53}"#,
@@ -1271,7 +1522,7 @@ mod tests {
 
         let put_req = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":443}"#,
@@ -1287,7 +1538,7 @@ mod tests {
 
         let delete_req = Request::builder()
             .method("DELETE")
-            .uri("/policy/ip:10.1.2.3?proto=tcp&dst_port=443")
+            .uri("/policy/cg:167838211?proto=tcp&dst_port=443")
             .body(Body::empty());
         let Ok(delete_request) = delete_req else {
             panic!("request should build");
@@ -1313,7 +1564,7 @@ mod tests {
 
         let req = Request::builder()
             .method("DELETE")
-            .uri("/policy/ip:10.1.2.3?proto=udp")
+            .uri("/policy/cg:167838211?proto=udp")
             .body(Body::empty());
         let Ok(request) = req else {
             panic!("request should build");
@@ -1336,7 +1587,7 @@ mod tests {
 
         let broad_put = Request::builder()
             .method("PUT")
-            .uri("/policy/ip:10.1.2.3")
+            .uri("/policy/cg:167838211")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true,"proto":"tcp","dst_port":0}"#,
@@ -1352,7 +1603,7 @@ mod tests {
 
         let resolve_req = Request::builder()
             .method("GET")
-            .uri("/policy/ip:10.1.2.3/resolve?proto=tcp&dst_port=443")
+            .uri("/policy/cg:167838211/resolve?proto=tcp&dst_port=443")
             .body(Body::empty());
         let Ok(resolve_request) = resolve_req else {
             panic!("request should build");
@@ -1511,7 +1762,7 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert_eq!(
             top[0]["flow"],
-            serde_json::json!("src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=*")
+            serde_json::json!("cgroup=167838211|proto=tcp|dport=443|method=*|path_hash=*")
         );
     }
 
@@ -1520,7 +1771,7 @@ mod tests {
         let counters = vec![
             (
                 TenantKey {
-                    src_ip: 2,
+                    cgroup_id: 2,
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
@@ -1535,7 +1786,7 @@ mod tests {
             ),
             (
                 TenantKey {
-                    src_ip: 1,
+                    cgroup_id: 1,
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
@@ -1550,7 +1801,7 @@ mod tests {
             ),
             (
                 TenantKey {
-                    src_ip: 3,
+                    cgroup_id: 3,
                     http_path_hash: 0,
                     dst_port: 80,
                     proto: 6,
@@ -1567,8 +1818,8 @@ mod tests {
 
         let top = build_top_tenants(counters, 2);
         assert_eq!(top.len(), 2);
-        assert_eq!(top[0].tenant.src_ip, 1);
-        assert_eq!(top[1].tenant.src_ip, 2);
+        assert_eq!(top[0].tenant.cgroup_id, 1);
+        assert_eq!(top[1].tenant.cgroup_id, 2);
     }
 
     #[tokio::test]
@@ -1637,7 +1888,9 @@ mod tests {
         let Ok(text) = text else {
             panic!("metrics response should be utf-8");
         };
-        assert!(text.contains("flow=\"src=10.1.2.3|proto=tcp|dport=443|method=*|path_hash=*\""));
-        assert!(text.contains("src_ip=\"10.1.2.3\""));
+        assert!(
+            text.contains("flow=\"cgroup=167838211|proto=tcp|dport=443|method=*|path_hash=*\"")
+        );
+        assert!(text.contains("cgroup_id=\"167838211\""));
     }
 }
