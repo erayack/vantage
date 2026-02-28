@@ -1,9 +1,11 @@
+pub mod adaptive;
 pub mod config;
 pub mod control_api;
 pub mod events;
 pub mod map_client;
 pub mod metrics;
 pub mod prereqs;
+pub mod tenancy;
 pub mod tenant;
 
 use std::sync::Arc;
@@ -29,14 +31,16 @@ use tracing::{info, warn};
 use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
 
 use crate::{
+    adaptive::{AdaptiveRuntimeState, spawn_adaptive_controller},
     config::Config,
     control_api::{
         debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled, metrics,
-        put_admin_enabled, put_policy, resolve_policy,
+        put_admin_enabled, put_policy, put_tenant_essential, resolve_policy, tenant_essential,
     },
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
     prereqs::ensure_cgroup_v2_mounted,
+    tenancy::TenancyState,
 };
 
 #[derive(Clone)]
@@ -52,6 +56,8 @@ pub struct AppState {
     pub(crate) drop_events: DropEventRuntime,
     pub(crate) maps: MapClient,
     pub(crate) metrics: MetricsState,
+    pub(crate) tenancy: TenancyState,
+    pub(crate) adaptive_runtime: AdaptiveRuntimeState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -70,6 +76,12 @@ struct HealthResponse {
     metrics_dimensional_enabled: bool,
     flow_keys_live: bool,
     debug_top_tenants: usize,
+    adaptive_enabled: bool,
+    adaptive_high_watermark_percent: u8,
+    adaptive_low_watermark_percent: u8,
+    adaptive_tick_ms: u64,
+    adaptive_throttle_rate_tokens_per_sec: u64,
+    adaptive_throttle_burst_tokens: u64,
     drop_events: DropEventRuntime,
 }
 
@@ -133,12 +145,18 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         drop_events,
         maps,
         metrics: metrics_state,
+        tenancy: TenancyState::new(config.essential_tenants.clone()),
+        adaptive_runtime: AdaptiveRuntimeState::default(),
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
         .route("/policy/:tenant/resolve", get(resolve_policy))
+        .route(
+            "/tenancy/:tenant/essential",
+            put(put_tenant_essential).get(tenant_essential),
+        )
         .route(
             "/admin/enabled",
             put(put_admin_enabled).get(get_admin_enabled),
@@ -147,6 +165,14 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         .route("/debug/cpu-window", get(debug_cpu_window))
         .route("/debug/snapshot", get(debug_snapshot))
         .with_state(state.clone());
+    let adaptive_task = if config.adaptive.enabled {
+        Some(spawn_adaptive_controller(
+            state.clone(),
+            shutdown_rx.clone(),
+        ))
+    } else {
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -161,6 +187,12 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         metrics_dimensional_enabled = config.metrics_dimensions.enabled(),
         flow_keys_live = config.flow_keys_mode.live(),
         debug_top_tenants = config.debug_top_tenants,
+        adaptive_enabled = config.adaptive.enabled,
+        adaptive_high_watermark_percent = config.adaptive.high_watermark_percent,
+        adaptive_low_watermark_percent = config.adaptive.low_watermark_percent,
+        adaptive_tick_ms = config.adaptive.tick_ms,
+        adaptive_throttle_rate_tokens_per_sec = config.adaptive.throttle_rate_tokens_per_sec,
+        adaptive_throttle_burst_tokens = config.adaptive.throttle_burst_tokens,
         kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
         "vantage daemon started"
     );
@@ -169,6 +201,13 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await
         .context("HTTP server exited with error")?;
+
+    if let Some(task) = adaptive_task {
+        let joined = task.await;
+        if let Err(error) = joined {
+            warn!(%error, "adaptive controller task exited unexpectedly");
+        }
+    }
 
     Ok(())
 }
@@ -267,6 +306,12 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
         metrics_dimensional_enabled: state.config.metrics_dimensions.enabled(),
         flow_keys_live: state.config.flow_keys_mode.live(),
         debug_top_tenants: state.config.debug_top_tenants,
+        adaptive_enabled: state.config.adaptive.enabled,
+        adaptive_high_watermark_percent: state.config.adaptive.high_watermark_percent,
+        adaptive_low_watermark_percent: state.config.adaptive.low_watermark_percent,
+        adaptive_tick_ms: state.config.adaptive.tick_ms,
+        adaptive_throttle_rate_tokens_per_sec: state.config.adaptive.throttle_rate_tokens_per_sec,
+        adaptive_throttle_burst_tokens: state.config.adaptive.throttle_burst_tokens,
         drop_events: state.drop_events,
     })
 }
@@ -300,8 +345,10 @@ mod tests {
 
     use super::{AppState, DropEventRuntime, MetricsState, direction_name, healthz};
     use crate::{
+        adaptive::AdaptiveRuntimeState,
         config::Config,
         map_client::{MapClient, MapError, MapOps},
+        tenancy::TenancyState,
     };
 
     struct NoopMapOps;
@@ -333,6 +380,10 @@ mod tests {
 
         fn get_runtime_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
             Ok(None)
+        }
+
+        fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            Ok(Vec::new())
         }
 
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
@@ -397,6 +448,8 @@ mod tests {
                 )
                 .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
+            tenancy: TenancyState::default(),
+            adaptive_runtime: AdaptiveRuntimeState::default(),
         }
     }
 
@@ -414,6 +467,15 @@ mod tests {
             flow_keys_mode: crate::config::FlowKeysMode::Live,
             debug_top_tenants: 10,
             policy_validation_mode: crate::config::PolicyValidationMode::Permissive,
+            adaptive: crate::config::AdaptiveConfig {
+                enabled: false,
+                high_watermark_percent: 90,
+                low_watermark_percent: 80,
+                tick_ms: 1_000,
+                throttle_rate_tokens_per_sec: 100,
+                throttle_burst_tokens: 500,
+            },
+            essential_tenants: std::collections::BTreeSet::new(),
         };
         assert_eq!(direction_name(&config), "both");
     }
@@ -432,6 +494,15 @@ mod tests {
             flow_keys_mode: crate::config::FlowKeysMode::Legacy,
             debug_top_tenants: 25,
             policy_validation_mode: crate::config::PolicyValidationMode::Permissive,
+            adaptive: crate::config::AdaptiveConfig {
+                enabled: true,
+                high_watermark_percent: 92,
+                low_watermark_percent: 78,
+                tick_ms: 750,
+                throttle_rate_tokens_per_sec: 50,
+                throttle_burst_tokens: 250,
+            },
+            essential_tenants: std::collections::BTreeSet::new(),
         };
         let state = test_state(
             config,
@@ -453,6 +524,12 @@ mod tests {
         assert!(json.metrics_dimensional_enabled);
         assert!(!json.flow_keys_live);
         assert_eq!(json.debug_top_tenants, 25);
+        assert!(json.adaptive_enabled);
+        assert_eq!(json.adaptive_high_watermark_percent, 92);
+        assert_eq!(json.adaptive_low_watermark_percent, 78);
+        assert_eq!(json.adaptive_tick_ms, 750);
+        assert_eq!(json.adaptive_throttle_rate_tokens_per_sec, 50);
+        assert_eq!(json.adaptive_throttle_burst_tokens, 250);
         assert_eq!(json.drop_events.log_sample_n, 5);
         assert!(json.drop_events.log_enabled);
     }

@@ -11,14 +11,19 @@ use vantage_common::{Counters, GlobalStats, Policy, PolicyMatchLevel, ReasonBuck
 
 use crate::{
     AppState,
+    adaptive::AdaptiveState,
     map_client::{MapError, PolicySource, ResolvedPolicy},
-    metrics::{CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async},
+    metrics::{
+        CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async,
+        sample_memory_percent_async,
+    },
+    tenancy::TenancyError,
     tenant::{
         FlowProto, TenantParseError, TenantRef, http_method_label, normalized_flow_key, proto_label,
     },
 };
 
-const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PutPolicyRequest {
@@ -35,6 +40,11 @@ pub(crate) struct PutPolicyRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PutEnabledRequest {
     pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PutEssentialRequest {
+    pub essential: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -58,6 +68,12 @@ pub(crate) struct ResolvePolicyQuery {
 #[derive(Debug, Serialize)]
 pub(crate) struct GlobalEnabledResponse {
     pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct EssentialTenantResponse {
+    pub tenant: u64,
+    pub essential: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +181,11 @@ pub(crate) struct BenchmarkSnapshot {
     pub version: u16,
     pub ts_unix_ms: u64,
     pub cpu: CpuWindowSample,
+    pub system_memory_percent: f64,
+    pub adaptive_state: AdaptiveState,
+    pub adaptive_high_watermark_percent: u8,
+    pub adaptive_low_watermark_percent: u8,
+    pub adaptive_managed_override_count: u64,
     pub global: GlobalStatsView,
     pub top_tenants: Vec<TenantCounterView>,
 }
@@ -225,6 +246,8 @@ pub(crate) enum ApiError {
     Tenant(#[from] TenantParseError),
     #[error(transparent)]
     Metrics(#[from] MetricsError),
+    #[error(transparent)]
+    Tenancy(#[from] TenancyError),
 }
 
 impl IntoResponse for ApiError {
@@ -239,6 +262,11 @@ impl IntoResponse for ApiError {
             Self::Metrics(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("metrics operation failed: {error}"),
+            )
+                .into_response(),
+            Self::Tenancy(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tenancy operation failed: {error}"),
             )
                 .into_response(),
         }
@@ -337,6 +365,42 @@ pub(crate) async fn get_admin_enabled(
 ) -> Result<Json<GlobalEnabledResponse>, ApiError> {
     let enabled = app.maps.get_global_enabled()?;
     Ok(Json(GlobalEnabledResponse { enabled }))
+}
+
+/// Marks or unmarks a tenant as essential for adaptive auto-throttling exclusion.
+///
+/// # Errors
+///
+/// Returns `ApiError` when tenant parsing or tenancy updates fail.
+pub(crate) async fn put_tenant_essential(
+    Path(tenant): Path<String>,
+    State(app): State<AppState>,
+    Json(req): Json<PutEssentialRequest>,
+) -> Result<Json<EssentialTenantResponse>, ApiError> {
+    let cgroup_id = parse_tenant_cgroup_id(&tenant)?;
+    let _ = app.tenancy.set_essential(cgroup_id, req.essential)?;
+
+    Ok(Json(EssentialTenantResponse {
+        tenant: cgroup_id,
+        essential: req.essential,
+    }))
+}
+
+/// Returns whether a tenant is currently marked essential.
+///
+/// # Errors
+///
+/// Returns `ApiError` when tenant parsing or tenancy lookups fail.
+pub(crate) async fn tenant_essential(
+    Path(tenant): Path<String>,
+    State(app): State<AppState>,
+) -> Result<Json<EssentialTenantResponse>, ApiError> {
+    let cgroup_id = parse_tenant_cgroup_id(&tenant)?;
+    let essential = app.tenancy.is_essential(cgroup_id)?;
+    Ok(Json(EssentialTenantResponse {
+        tenant: cgroup_id,
+        essential,
+    }))
 }
 
 /// Deletes a tenant policy from `POLICY_MAP`.
@@ -448,6 +512,8 @@ pub(crate) async fn debug_snapshot(
 ) -> Result<Json<BenchmarkSnapshot>, ApiError> {
     let sample_window = std::time::Duration::from_millis(app.config.cpu_window_ms);
     let cpu = sample_cpu_window_async(sample_window).await?;
+    let system_memory_percent = sample_memory_percent_async().await?;
+    let adaptive = app.adaptive_runtime.snapshot();
     let global = app.maps.read_global_stats()?;
     let top_tenants = build_top_tenants(app.maps.collect_counters()?, app.config.debug_top_tenants);
     let ts_unix_ms = std::time::SystemTime::now()
@@ -460,6 +526,11 @@ pub(crate) async fn debug_snapshot(
         version: DEBUG_SNAPSHOT_SCHEMA_VERSION,
         ts_unix_ms,
         cpu,
+        system_memory_percent,
+        adaptive_state: adaptive.state,
+        adaptive_high_watermark_percent: app.config.adaptive.high_watermark_percent,
+        adaptive_low_watermark_percent: app.config.adaptive.low_watermark_percent,
+        adaptive_managed_override_count: adaptive.active_override_count,
         global: global.into(),
         top_tenants,
     }))
@@ -470,6 +541,11 @@ fn parse_proto(proto: Option<&str>) -> Result<Option<FlowProto>, TenantParseErro
         Some(raw) => Ok(Some(FlowProto::parse(raw)?)),
         None => Ok(None),
     }
+}
+
+fn parse_tenant_cgroup_id(raw: &str) -> Result<u64, TenantParseError> {
+    let tenant = TenantRef::parse(raw)?;
+    Ok(tenant.to_tenant_key().cgroup_id)
 }
 
 const fn policy_precedence_contract() -> &'static str {
@@ -550,12 +626,15 @@ mod tests {
 
     use super::{
         PARTIAL_L7_POLICY_WARNING, build_top_tenants, debug_cpu_window, debug_snapshot,
-        delete_policy, get_admin_enabled, metrics, put_admin_enabled, put_policy, resolve_policy,
+        delete_policy, get_admin_enabled, metrics, put_admin_enabled, put_policy,
+        put_tenant_essential, resolve_policy, tenant_essential,
     };
     use crate::{
         AppState, DropEventRuntime, MetricsState,
+        adaptive::AdaptiveRuntimeState,
         config::{Config, PolicyValidationMode},
         map_client::{MapClient, MapError, MapOps},
+        tenancy::TenancyState,
         tenant::compute_http_path_hash,
     };
 
@@ -646,6 +725,11 @@ mod tests {
                 .get(&tenant)
                 .copied();
             Ok(policy)
+        }
+
+        fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            let policies = self.policies.lock().map_err(|_| MapError::LockPoisoned)?;
+            Ok(policies.keys().copied().collect())
         }
 
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
@@ -748,6 +832,15 @@ mod tests {
                 flow_keys_mode: crate::config::FlowKeysMode::Live,
                 debug_top_tenants: 10,
                 policy_validation_mode: PolicyValidationMode::Permissive,
+                adaptive: crate::config::AdaptiveConfig {
+                    enabled: false,
+                    high_watermark_percent: 90,
+                    low_watermark_percent: 80,
+                    tick_ms: 1_000,
+                    throttle_rate_tokens_per_sec: 100,
+                    throttle_burst_tokens: 500,
+                },
+                essential_tenants: std::collections::BTreeSet::new(),
             },
             drop_events: DropEventRuntime {
                 kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
@@ -760,6 +853,8 @@ mod tests {
                 daemon_up,
                 partial_l7_policy_keys_total,
             },
+            tenancy: TenancyState::default(),
+            adaptive_runtime: AdaptiveRuntimeState::default(),
         }
     }
 
@@ -817,11 +912,25 @@ mod tests {
     }
 
     fn assert_snapshot_basics(payload: &serde_json::Value) {
-        assert_eq!(payload["version"], serde_json::json!(2));
+        assert_eq!(payload["version"], serde_json::json!(3));
         assert!(payload["ts_unix_ms"].as_u64().is_some());
         assert!(payload["cpu"]["window_ms"].as_u64().is_some());
         assert!(payload["cpu"]["system_cpu_percent"].as_f64().is_some());
         assert!(payload["cpu"]["daemon_cpu_percent"].as_f64().is_some());
+        assert!(payload["system_memory_percent"].as_f64().is_some());
+        assert_eq!(payload["adaptive_state"], serde_json::json!("inactive"));
+        assert_eq!(
+            payload["adaptive_high_watermark_percent"],
+            serde_json::json!(90)
+        );
+        assert_eq!(
+            payload["adaptive_low_watermark_percent"],
+            serde_json::json!(80)
+        );
+        assert_eq!(
+            payload["adaptive_managed_override_count"],
+            serde_json::json!(0)
+        );
         assert_eq!(payload["global"]["pass_pkts"], serde_json::json!(11));
         assert_eq!(payload["global"]["drop_pkts"], serde_json::json!(3));
         assert_eq!(payload["global"]["pass_bytes"], serde_json::json!(1_500));
@@ -1892,5 +2001,77 @@ mod tests {
             text.contains("flow=\"cgroup=167838211|proto=tcp|dport=443|method=*|path_hash=*\"")
         );
         assert!(text.contains("cgroup_id=\"167838211\""));
+        assert!(text.contains("http_method=\"*\""));
+        assert!(text.contains("http_path_hash=\"*\""));
+    }
+
+    #[tokio::test]
+    async fn tenancy_endpoint_defaults_to_non_essential() {
+        let state = test_state(MapClient::from_ops(Arc::new(InMemoryMapOps::new())));
+        let app = Router::new()
+            .route("/tenancy/:tenant/essential", get(tenant_essential))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/tenancy/cg:42/essential")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let response = app
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|error| panic!("response body should be readable: {error}"));
+        let payload: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("response should be valid json: {error}"));
+        assert_eq!(payload["tenant"], serde_json::json!(42));
+        assert_eq!(payload["essential"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn tenancy_endpoint_can_mark_essential() {
+        let state = test_state(MapClient::from_ops(Arc::new(InMemoryMapOps::new())));
+        let app = Router::new()
+            .route(
+                "/tenancy/:tenant/essential",
+                put(put_tenant_essential).get(tenant_essential),
+            )
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/tenancy/99/essential")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"essential":true}"#))
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let read_back = Request::builder()
+            .method("GET")
+            .uri("/tenancy/99/essential")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let response = app
+            .oneshot(read_back)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|error| panic!("response body should be readable: {error}"));
+        let payload: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("response should be valid json: {error}"));
+        assert_eq!(payload["tenant"], serde_json::json!(99));
+        assert_eq!(payload["essential"], serde_json::json!(true));
     }
 }

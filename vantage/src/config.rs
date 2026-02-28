@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::BTreeSet, net::SocketAddr, num::ParseIntError};
 
 use clap::{Parser, ValueEnum};
 use vantage_common::GlobalConfig;
@@ -44,6 +44,16 @@ impl PolicyValidationMode {
     pub(crate) const fn strict(self) -> bool {
         matches!(self, Self::Strict)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdaptiveConfig {
+    pub(crate) enabled: bool,
+    pub(crate) high_watermark_percent: u8,
+    pub(crate) low_watermark_percent: u8,
+    pub(crate) tick_ms: u64,
+    pub(crate) throttle_rate_tokens_per_sec: u64,
+    pub(crate) throttle_burst_tokens: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -100,6 +110,45 @@ struct Cli {
         env = "VANTAGE_POLICY_VALIDATION_MODE"
     )]
     policy_validation_mode: PolicyValidationMode,
+    #[arg(long = "adaptive-enabled", env = "VANTAGE_ADAPTIVE_ENABLED")]
+    adaptive_enabled: bool,
+    #[arg(
+        long = "adaptive-high-watermark-percent",
+        default_value_t = 90_u8,
+        env = "VANTAGE_ADAPTIVE_HIGH_WATERMARK_PERCENT"
+    )]
+    adaptive_high_watermark_percent: u8,
+    #[arg(
+        long = "adaptive-low-watermark-percent",
+        default_value_t = 80_u8,
+        env = "VANTAGE_ADAPTIVE_LOW_WATERMARK_PERCENT"
+    )]
+    adaptive_low_watermark_percent: u8,
+    #[arg(
+        long = "adaptive-tick-ms",
+        default_value_t = 1_000_u64,
+        env = "VANTAGE_ADAPTIVE_TICK_MS"
+    )]
+    adaptive_tick_ms: u64,
+    #[arg(
+        long = "adaptive-throttle-rate-tokens-per-sec",
+        default_value_t = 100_u64,
+        env = "VANTAGE_ADAPTIVE_THROTTLE_RATE_TOKENS_PER_SEC"
+    )]
+    adaptive_throttle_rate_tokens_per_sec: u64,
+    #[arg(
+        long = "adaptive-throttle-burst-tokens",
+        default_value_t = 500_u64,
+        env = "VANTAGE_ADAPTIVE_THROTTLE_BURST_TOKENS"
+    )]
+    adaptive_throttle_burst_tokens: u64,
+    #[arg(
+        long = "essential-tenant",
+        env = "VANTAGE_ESSENTIAL_TENANTS",
+        value_delimiter = ',',
+        value_parser = parse_essential_tenant
+    )]
+    essential_tenants: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +164,8 @@ pub(crate) struct Config {
     pub(crate) flow_keys_mode: FlowKeysMode,
     pub(crate) debug_top_tenants: usize,
     pub(crate) policy_validation_mode: PolicyValidationMode,
+    pub(crate) adaptive: AdaptiveConfig,
+    pub(crate) essential_tenants: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +206,10 @@ impl Config {
             AttachDirection::Egress => (false, true),
             AttachDirection::Both => (true, true),
         };
+        let adaptive_high_watermark_percent = cli.adaptive_high_watermark_percent.clamp(2, 100);
+        let adaptive_low_watermark_percent = cli
+            .adaptive_low_watermark_percent
+            .clamp(1, adaptive_high_watermark_percent.saturating_sub(1));
 
         Self {
             iface: cli.iface,
@@ -172,6 +227,15 @@ impl Config {
             flow_keys_mode: cli.flow_keys_mode,
             debug_top_tenants: cli.debug_top_tenants.clamp(1, 100),
             policy_validation_mode: cli.policy_validation_mode,
+            adaptive: AdaptiveConfig {
+                enabled: cli.adaptive_enabled,
+                high_watermark_percent: adaptive_high_watermark_percent,
+                low_watermark_percent: adaptive_low_watermark_percent,
+                tick_ms: cli.adaptive_tick_ms.max(1),
+                throttle_rate_tokens_per_sec: cli.adaptive_throttle_rate_tokens_per_sec.max(1),
+                throttle_burst_tokens: cli.adaptive_throttle_burst_tokens.max(1),
+            },
+            essential_tenants: cli.essential_tenants.into_iter().collect(),
         }
     }
 
@@ -181,6 +245,14 @@ impl Config {
             flow_keys_live: self.flow_keys_mode.live(),
         }
     }
+}
+
+fn parse_essential_tenant(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let value = trimmed.strip_prefix("cg:").unwrap_or(trimmed);
+    value
+        .parse::<u64>()
+        .map_err(|error: ParseIntError| format!("invalid essential tenant '{raw}': {error}"))
 }
 
 #[cfg(test)]
@@ -325,6 +397,95 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_config_defaults_are_set() {
+        let parsed = Config::try_from_iter(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert!(!config.adaptive.enabled);
+        assert_eq!(config.adaptive.high_watermark_percent, 90);
+        assert_eq!(config.adaptive.low_watermark_percent, 80);
+        assert_eq!(config.adaptive.tick_ms, 1_000);
+        assert_eq!(config.adaptive.throttle_rate_tokens_per_sec, 100);
+        assert_eq!(config.adaptive.throttle_burst_tokens, 500);
+    }
+
+    #[test]
+    fn adaptive_tick_ms_is_clamped_to_one() {
+        let parsed = Config::try_from_iter(["vantage", "--adaptive-tick-ms", "0"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.tick_ms, 1);
+    }
+
+    #[test]
+    fn adaptive_throttle_values_are_clamped_to_one() {
+        let parsed = Config::try_from_iter([
+            "vantage",
+            "--adaptive-throttle-rate-tokens-per-sec",
+            "0",
+            "--adaptive-throttle-burst-tokens",
+            "0",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.throttle_rate_tokens_per_sec, 1);
+        assert_eq!(config.adaptive.throttle_burst_tokens, 1);
+    }
+
+    #[test]
+    fn adaptive_high_watermark_is_clamped_to_hundred() {
+        let parsed = Config::try_from_iter(["vantage", "--adaptive-high-watermark-percent", "255"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.high_watermark_percent, 100);
+    }
+
+    #[test]
+    fn adaptive_high_watermark_is_clamped_to_minimum_two() {
+        let parsed = Config::try_from_iter(["vantage", "--adaptive-high-watermark-percent", "1"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.high_watermark_percent, 2);
+    }
+
+    #[test]
+    fn adaptive_low_watermark_is_clamped_below_high() {
+        let parsed = Config::try_from_iter([
+            "vantage",
+            "--adaptive-high-watermark-percent",
+            "80",
+            "--adaptive-low-watermark-percent",
+            "99",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.high_watermark_percent, 80);
+        assert_eq!(config.adaptive.low_watermark_percent, 79);
+    }
+
+    #[test]
+    fn adaptive_low_watermark_remains_recoverable_when_high_is_minimum() {
+        let parsed = Config::try_from_iter([
+            "vantage",
+            "--adaptive-high-watermark-percent",
+            "1",
+            "--adaptive-low-watermark-percent",
+            "0",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.adaptive.high_watermark_percent, 2);
+        assert_eq!(config.adaptive.low_watermark_percent, 1);
+    }
+
+    #[test]
     fn global_config_seed_enables_filtering_by_default() {
         let parsed = Config::try_from_iter(["vantage"]);
         let Ok(config) = parsed else {
@@ -346,5 +507,35 @@ mod tests {
         let seed = config.global_config_seed().as_global_config();
         assert_eq!(seed.enabled, 1);
         assert_eq!(seed.flow_keys_live, 0);
+    }
+
+    #[test]
+    fn essential_tenants_parse_mixed_formats() {
+        let parsed = Config::try_from_iter([
+            "vantage",
+            "--essential-tenant",
+            "cg:42",
+            "--essential-tenant",
+            "7",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+
+        assert!(config.essential_tenants.contains(&42));
+        assert!(config.essential_tenants.contains(&7));
+        assert_eq!(config.essential_tenants.len(), 2);
+    }
+
+    #[test]
+    fn essential_tenants_can_be_parsed_from_env_csv() {
+        temp_env::with_var("VANTAGE_ESSENTIAL_TENANTS", Some("cg:11,12"), || {
+            let parsed = Config::try_from_iter(["vantage"]);
+            let Ok(config) = parsed else {
+                panic!("config parsing should succeed");
+            };
+            assert!(config.essential_tenants.contains(&11));
+            assert!(config.essential_tenants.contains(&12));
+        });
     }
 }

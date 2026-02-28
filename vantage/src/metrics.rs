@@ -11,7 +11,9 @@ use vantage_common::{Counters, TenantKey};
 use crate::{
     MetricsState,
     map_client::{MapClient, MapError},
-    tenant::{cgroup_id_label, normalized_flow_key, proto_label},
+    tenant::{
+        cgroup_id_label, http_method_label, normalized_flow_key, path_hash_label, proto_label,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -36,6 +38,13 @@ pub(crate) struct CpuWindowSample {
     pub window_ms: u64,
     pub system_cpu_percent: f64,
     pub daemon_cpu_percent: f64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) struct HostLoadSample {
+    pub window_ms: u64,
+    pub system_cpu_percent: f64,
+    pub system_memory_percent: f64,
 }
 
 /// Builds Prometheus text output from tenant counters in `COUNTERS_MAP`.
@@ -94,6 +103,46 @@ pub(crate) async fn sample_cpu_window_async(
     window: Duration,
 ) -> Result<CpuWindowSample, MetricsError> {
     tokio::task::spawn_blocking(move || sample_cpu_window(window))
+        .await
+        .map_err(MetricsError::from)?
+}
+
+/// Samples host CPU and memory utilization over a fixed window.
+///
+/// # Errors
+///
+/// Returns `MetricsError` if procfs reads/parsing fail.
+pub(crate) fn sample_host_load_window(window: Duration) -> Result<HostLoadSample, MetricsError> {
+    let cpu = sample_cpu_window(window)?;
+    let memory_percent = read_memory_percent()?;
+
+    Ok(HostLoadSample {
+        window_ms: cpu.window_ms,
+        system_cpu_percent: cpu.system_cpu_percent,
+        system_memory_percent: memory_percent,
+    })
+}
+
+/// Samples host CPU and memory utilization on a blocking thread.
+///
+/// # Errors
+///
+/// Returns `MetricsError` if task scheduling, procfs reads, or parsing fail.
+pub(crate) async fn sample_host_load_window_async(
+    window: Duration,
+) -> Result<HostLoadSample, MetricsError> {
+    tokio::task::spawn_blocking(move || sample_host_load_window(window))
+        .await
+        .map_err(MetricsError::from)?
+}
+
+/// Samples current host memory utilization from procfs on a blocking thread.
+///
+/// # Errors
+///
+/// Returns `MetricsError` if task scheduling, procfs reads, or parsing fail.
+pub(crate) async fn sample_memory_percent_async() -> Result<f64, MetricsError> {
+    tokio::task::spawn_blocking(read_memory_percent)
         .await
         .map_err(MetricsError::from)?
 }
@@ -205,6 +254,62 @@ fn read_daemon_jiffies() -> Result<u64, MetricsError> {
     parse_daemon_jiffies(&text)
 }
 
+fn read_memory_percent() -> Result<f64, MetricsError> {
+    const PATH: &str = "/proc/meminfo";
+    let text =
+        fs::read_to_string(PATH).map_err(|source| MetricsError::ReadProc { path: PATH, source })?;
+    parse_meminfo_percent(&text)
+}
+
+fn parse_meminfo_percent(text: &str) -> Result<f64, MetricsError> {
+    const PATH: &str = "/proc/meminfo";
+    let mut mem_total_kib: Option<u64> = None;
+    let mut mem_available_kib: Option<u64> = None;
+
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("MemTotal:") {
+            mem_total_kib = Some(parse_meminfo_field(value, "MemTotal")?);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("MemAvailable:") {
+            mem_available_kib = Some(parse_meminfo_field(value, "MemAvailable")?);
+        }
+    }
+
+    let total = mem_total_kib.ok_or_else(|| MetricsError::ParseProc {
+        path: PATH,
+        reason: "missing MemTotal field".to_owned(),
+    })?;
+    let available = mem_available_kib.ok_or_else(|| MetricsError::ParseProc {
+        path: PATH,
+        reason: "missing MemAvailable field".to_owned(),
+    })?;
+
+    if total == 0 {
+        return Ok(0.0);
+    }
+
+    let used = total.saturating_sub(available.min(total));
+    ratio_percent(used, total)
+}
+
+fn parse_meminfo_field(value: &str, field: &str) -> Result<u64, MetricsError> {
+    const PATH: &str = "/proc/meminfo";
+    let token = value
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| MetricsError::ParseProc {
+            path: PATH,
+            reason: format!("missing value for {field}"),
+        })?;
+    token
+        .parse::<u64>()
+        .map_err(|error| MetricsError::ParseProc {
+            path: PATH,
+            reason: format!("invalid {field} value '{token}': {error}"),
+        })
+}
+
 fn parse_daemon_jiffies(text: &str) -> Result<u64, MetricsError> {
     const PATH: &str = "/proc/self/stat";
     let close_paren = text.rfind(')').ok_or_else(|| MetricsError::ParseProc {
@@ -262,39 +367,49 @@ fn append_counter_metrics(counters: &[(TenantKey, Counters)], dimensional: bool)
             } else {
                 tenant.dst_port.to_string()
             };
+            let http_method = http_method_label(tenant.http_method);
+            let http_path_hash = path_hash_label(tenant.http_path_hash);
             let _ = writeln!(
                 payload,
-                "vantage_tenant_pass_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                "vantage_tenant_pass_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",http_method=\"{}\",http_path_hash=\"{}\",flow=\"{}\"}} {}",
                 cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
+                http_method,
+                http_path_hash,
                 flow_key,
                 counters.pass_pkts
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_drop_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                "vantage_tenant_drop_packets{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",http_method=\"{}\",http_path_hash=\"{}\",flow=\"{}\"}} {}",
                 cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
+                http_method,
+                http_path_hash,
                 flow_key,
                 counters.drop_pkts
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_pass_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                "vantage_tenant_pass_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",http_method=\"{}\",http_path_hash=\"{}\",flow=\"{}\"}} {}",
                 cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
+                http_method,
+                http_path_hash,
                 flow_key,
                 counters.pass_bytes
             );
             let _ = writeln!(
                 payload,
-                "vantage_tenant_drop_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",flow=\"{}\"}} {}",
+                "vantage_tenant_drop_bytes{{cgroup_id=\"{}\",dst_port=\"{}\",proto=\"{}\",http_method=\"{}\",http_path_hash=\"{}\",flow=\"{}\"}} {}",
                 cgroup_id_label(tenant.cgroup_id),
                 dst_port,
                 proto_label(tenant.proto),
+                http_method,
+                http_path_hash,
                 flow_key,
                 counters.drop_bytes
             );
@@ -365,12 +480,12 @@ mod tests {
         let text = payload;
         assert!(
             text.contains(
-                "vantage_tenant_pass_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 1\n"
+                "vantage_tenant_pass_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",http_method=\"*\",http_path_hash=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 1\n"
             )
         );
         assert!(
             text.contains(
-                "vantage_tenant_drop_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 2\n"
+                "vantage_tenant_drop_packets{cgroup_id=\"167838211\",dst_port=\"*\",proto=\"*\",http_method=\"*\",http_path_hash=\"*\",flow=\"cgroup=167838211|proto=*|dport=*|method=*|path_hash=*\"} 2\n"
             )
         );
         assert!(!text.contains("\\n"));
@@ -529,5 +644,19 @@ mod tests {
         };
 
         assert!(sample.system_cpu_percent >= 0.0);
+    }
+
+    #[test]
+    fn parse_meminfo_percent_reads_usage() {
+        let text = "\
+MemTotal:       1000 kB
+MemFree:         100 kB
+MemAvailable:    250 kB
+";
+        let parsed = parse_meminfo_percent(text);
+        let Ok(percent) = parsed else {
+            panic!("meminfo should parse");
+        };
+        assert!((percent - 75.0).abs() < f64::EPSILON);
     }
 }
