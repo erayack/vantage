@@ -52,6 +52,7 @@ pub(crate) trait MapOps: Send + Sync {
     fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
     fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
     fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError>;
+    fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError>;
     fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError>;
     fn read_global_stats(&self) -> Result<GlobalStats, MapError>;
     fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError>;
@@ -218,6 +219,15 @@ impl MapClient {
         self.inner.collect_policy_keys()
     }
 
+    /// Reads all policy keys from `RUNTIME_POLICY_MAP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map iteration fails.
+    pub fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+        self.inner.collect_runtime_policy_keys()
+    }
+
     /// Reads all cgroup IDs with at least one base policy selector in `POLICY_MAP`.
     ///
     /// # Errors
@@ -374,28 +384,11 @@ impl MapOps for EbpfMapOps {
     }
 
     fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
-        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
-        let mut keys = {
-            let map = ebpf
-                .map_mut(POLICY_MAP_NAME)
-                .ok_or(MapError::MissingMap(POLICY_MAP_NAME))?;
-            let policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+        self.collect_policy_keys_from_map(POLICY_MAP_NAME, false)
+    }
 
-            let mut keys = Vec::new();
-            for pair in &policy_map {
-                let (tenant, _) = pair?;
-                keys.push(tenant);
-            }
-            keys
-        };
-        drop(ebpf);
-
-        if keys.len() > 1 {
-            keys.sort_unstable();
-            keys.dedup();
-        }
-
-        Ok(keys)
+    fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+        self.collect_policy_keys_from_map(RUNTIME_POLICY_MAP_NAME, true)
     }
 
     fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
@@ -459,6 +452,36 @@ impl MapOps for EbpfMapOps {
 }
 
 impl EbpfMapOps {
+    fn collect_policy_keys_from_map(
+        &self,
+        map_name: &'static str,
+        missing_map_is_empty: bool,
+    ) -> Result<Vec<TenantKey>, MapError> {
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let mut keys = {
+            let map = match ebpf.map_mut(map_name) {
+                Some(map) => map,
+                None if missing_map_is_empty => return Ok(Vec::new()),
+                None => return Err(MapError::MissingMap(map_name)),
+            };
+            let policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+
+            let mut keys = Vec::new();
+            for pair in &policy_map {
+                let (tenant, _) = pair?;
+                keys.push(tenant);
+            }
+            keys
+        };
+        drop(ebpf);
+
+        if keys.len() > 1 {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+
+        Ok(keys)
+    }
     fn upsert_policy_to_map(
         &self,
         map_name: &'static str,
@@ -626,6 +649,14 @@ mod tests {
 
         fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
             let policies = self.policies.lock().map_err(|_| MapError::LockPoisoned)?;
+            Ok(policies.keys().copied().collect())
+        }
+
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            let policies = self
+                .runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?;
             Ok(policies.keys().copied().collect())
         }
 
@@ -803,6 +834,42 @@ mod tests {
         assert_eq!(tenants.len(), 2);
         assert!(tenants.contains(&10));
         assert!(tenants.contains(&20));
+    }
+
+    #[test]
+    fn collect_runtime_policy_keys_reads_runtime_entries() {
+        let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let key_a = TenantKey {
+            cgroup_id: 10,
+            http_path_hash: 0,
+            dst_port: 80,
+            proto: 6,
+            http_method: 0,
+        };
+        let key_b = TenantKey {
+            cgroup_id: 10,
+            http_path_hash: 1,
+            dst_port: 8080,
+            proto: 6,
+            http_method: 1,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 100,
+            burst_tokens: 100,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+
+        assert!(maps.upsert_runtime_policy(key_b, policy).is_ok());
+        assert!(maps.upsert_runtime_policy(key_a, policy).is_ok());
+
+        let collected = maps.collect_runtime_policy_keys();
+        let Ok(mut collected) = collected else {
+            panic!("runtime policy key collection should succeed");
+        };
+        collected.sort_unstable();
+        assert_eq!(collected, vec![key_a, key_b]);
     }
 
     #[test]

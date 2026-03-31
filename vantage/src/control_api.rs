@@ -969,6 +969,14 @@ mod tests {
             Ok(policies.keys().copied().collect())
         }
 
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            let policies = self
+                .runtime_policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?;
+            Ok(policies.keys().copied().collect())
+        }
+
         fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
             Ok(self.counters.clone())
         }
@@ -1078,6 +1086,8 @@ mod tests {
                     throttle_rate_tokens_per_sec: 100,
                     throttle_burst_tokens: 500,
                 },
+                reconcile_tick_ms: 1_000,
+                reconcile_deep_check_every_n: 30,
                 essential_tenants: std::collections::BTreeSet::new(),
             },
             drop_events: DropEventRuntime {
@@ -1090,6 +1100,11 @@ mod tests {
                 registry,
                 daemon_up,
                 partial_l7_policy_keys_total,
+                reconcile_failures_total: IntCounter::new(
+                    "vantage_reconcile_failures_total",
+                    "Total number of non-fatal reconcile tick failures",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
             state_store,
             tenancy: TenancyState::default(),

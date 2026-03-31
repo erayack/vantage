@@ -143,6 +143,18 @@ struct Cli {
     )]
     adaptive_throttle_burst_tokens: u64,
     #[arg(
+        long = "reconcile-tick-ms",
+        default_value_t = 1_000_u64,
+        env = "VANTAGE_RECONCILE_TICK_MS"
+    )]
+    reconcile_tick_ms: u64,
+    #[arg(
+        long = "reconcile-deep-check-every-n",
+        default_value_t = 30_u64,
+        env = "VANTAGE_RECONCILE_DEEP_CHECK_EVERY_N"
+    )]
+    reconcile_deep_check_every_n: u64,
+    #[arg(
         long = "essential-tenant",
         env = "VANTAGE_ESSENTIAL_TENANTS",
         value_delimiter = ',',
@@ -165,6 +177,8 @@ pub(crate) struct Config {
     pub(crate) debug_top_tenants: usize,
     pub(crate) policy_validation_mode: PolicyValidationMode,
     pub(crate) adaptive: AdaptiveConfig,
+    pub(crate) reconcile_tick_ms: u64,
+    pub(crate) reconcile_deep_check_every_n: u64,
     pub(crate) essential_tenants: BTreeSet<u64>,
 }
 
@@ -235,6 +249,8 @@ impl Config {
                 throttle_rate_tokens_per_sec: cli.adaptive_throttle_rate_tokens_per_sec.max(1),
                 throttle_burst_tokens: cli.adaptive_throttle_burst_tokens.max(1),
             },
+            reconcile_tick_ms: cli.reconcile_tick_ms.max(1),
+            reconcile_deep_check_every_n: cli.reconcile_deep_check_every_n.max(1),
             essential_tenants: cli.essential_tenants.into_iter().collect(),
         }
     }
@@ -433,6 +449,32 @@ mod tests {
         };
         assert_eq!(config.adaptive.throttle_rate_tokens_per_sec, 1);
         assert_eq!(config.adaptive.throttle_burst_tokens, 1);
+    }
+
+    #[test]
+    fn reconcile_defaults_are_set() {
+        let parsed = Config::try_from_iter(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.reconcile_tick_ms, 1_000);
+        assert_eq!(config.reconcile_deep_check_every_n, 30);
+    }
+
+    #[test]
+    fn reconcile_values_are_clamped_to_one() {
+        let parsed = Config::try_from_iter([
+            "vantage",
+            "--reconcile-tick-ms",
+            "0",
+            "--reconcile-deep-check-every-n",
+            "0",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(config.reconcile_tick_ms, 1);
+        assert_eq!(config.reconcile_deep_check_every_n, 1);
     }
 
     #[test]

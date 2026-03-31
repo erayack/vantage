@@ -9,7 +9,11 @@ pub mod state_store;
 pub mod tenancy;
 pub mod tenant;
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use axum::{
@@ -27,9 +31,14 @@ use aya::{
 use prometheus::{IntCounter, IntGauge, Registry};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{signal, sync::watch};
+use tokio::{
+    signal,
+    sync::watch,
+    task::JoinHandle,
+    time::{MissedTickBehavior, interval},
+};
 use tracing::{info, warn};
-use vantage_common::KERNEL_DROP_EVENT_SAMPLE_EVERY;
+use vantage_common::{KERNEL_DROP_EVENT_SAMPLE_EVERY, Policy, TenantKey};
 
 use crate::{
     adaptive::{AdaptiveRuntimeState, spawn_adaptive_controller},
@@ -39,8 +48,8 @@ use crate::{
         metrics, put_admin_enabled, put_policy, put_runtime_policy, put_tenant_essential,
         resolve_policy, tenant_essential,
     },
-    events::{spawn_drop_event_consumer, take_drop_event_ring},
-    map_client::MapClient,
+    events::{RingBufferHandle, spawn_drop_event_consumer, take_drop_event_ring},
+    map_client::{MapClient, MapError},
     prereqs::ensure_cgroup_v2_mounted,
     tenancy::TenancyState,
 };
@@ -50,6 +59,7 @@ pub(crate) struct MetricsState {
     pub(crate) registry: Registry,
     pub(crate) daemon_up: IntGauge,
     pub(crate) partial_l7_policy_keys_total: IntCounter,
+    pub(crate) reconcile_failures_total: IntCounter,
 }
 
 #[derive(Clone)]
@@ -127,17 +137,29 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
 
     attach_tc(&mut ebpf, &config)?;
 
-    if config.drop_event_log_enabled {
-        let ring_buf =
-            take_drop_event_ring(&mut ebpf).context("failed to acquire DROP_EVENTS map")?;
+    let drop_event_ring: Option<RingBufferHandle> = if config.drop_event_log_enabled {
+        Some(take_drop_event_ring(&mut ebpf).context("failed to acquire DROP_EVENTS map")?)
+    } else {
+        None
+    };
+
+    let state = build_app_state(&config, ebpf, DEFAULT_STATE_FILE_PATH)?;
+    let initial_reconciled_revision = reconcile_once(&state)
+        .context("failed to complete startup reconcile before serving traffic")?;
+    if let Some(ring_buf) = drop_event_ring {
         spawn_drop_event_consumer(
             ring_buf,
             shutdown_rx.clone(),
             config.drop_event_log_sample_n,
         );
     }
-
-    let state = build_app_state(&config, ebpf, DEFAULT_STATE_FILE_PATH)?;
+    let reconcile_task = spawn_reconcile_controller(
+        state.clone(),
+        shutdown_rx.clone(),
+        initial_reconciled_revision,
+        config.reconcile_tick_ms,
+        config.reconcile_deep_check_every_n,
+    );
     let app = build_router(state.clone());
     let flow_keys_live = state
         .maps
@@ -171,6 +193,8 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         adaptive_tick_ms = config.adaptive.tick_ms,
         adaptive_throttle_rate_tokens_per_sec = config.adaptive.throttle_rate_tokens_per_sec,
         adaptive_throttle_burst_tokens = config.adaptive.throttle_burst_tokens,
+        reconcile_tick_ms = config.reconcile_tick_ms,
+        reconcile_deep_check_every_n = config.reconcile_deep_check_every_n,
         kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
         "vantage daemon started"
     );
@@ -185,6 +209,10 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         if let Err(error) = joined {
             warn!(%error, "adaptive controller task exited unexpectedly");
         }
+    }
+    let reconcile_joined = reconcile_task.await;
+    if let Err(error) = reconcile_joined {
+        warn!(%error, "reconcile controller task exited unexpectedly");
     }
 
     Ok(())
@@ -251,6 +279,166 @@ fn build_router(state: AppState) -> Router {
         .route("/debug/cpu-window", get(debug_cpu_window))
         .route("/debug/snapshot", get(debug_snapshot))
         .with_state(state)
+}
+
+fn reconcile_once(app: &AppState) -> anyhow::Result<u64> {
+    let (snapshot, snapshot_revision) = app
+        .state_store
+        .snapshot_with_revision()
+        .context("failed to capture persisted state snapshot for reconcile")?;
+
+    let global_enabled = app
+        .maps
+        .get_global_enabled()
+        .context("failed to read GLOBAL_CONFIG_MAP enabled state for reconcile")?;
+    let flow_keys_live = app
+        .maps
+        .get_flow_keys_live()
+        .context("failed to read GLOBAL_CONFIG_MAP flow-keys state for reconcile")?;
+    if global_enabled != snapshot.global_enabled || flow_keys_live != snapshot.flow_keys_live {
+        app.maps
+            .seed_global_config(
+                config::GlobalConfigSeed {
+                    enabled: snapshot.global_enabled,
+                    flow_keys_live: snapshot.flow_keys_live,
+                }
+                .as_global_config(),
+            )
+            .context("failed to reconcile GLOBAL_CONFIG_MAP from persisted state")?;
+    }
+
+    let desired_base = snapshot.base_policies;
+    let mut desired_runtime = BTreeMap::new();
+    for (&tenant, record) in &snapshot.runtime_overrides {
+        desired_runtime.insert(tenant, record.policy);
+    }
+
+    let base_keys = app
+        .maps
+        .collect_policy_keys()
+        .context("failed to collect base policy keys for reconcile")?;
+    reconcile_policy_map(
+        &desired_base,
+        base_keys,
+        |tenant| app.maps.get_policy(tenant),
+        |tenant, policy| app.maps.upsert_policy(tenant, policy),
+        |tenant| app.maps.delete_policy(tenant),
+    )
+    .context("failed to reconcile POLICY_MAP from persisted state")?;
+
+    let runtime_keys = app
+        .maps
+        .collect_runtime_policy_keys()
+        .context("failed to collect runtime policy keys for reconcile")?;
+    reconcile_policy_map(
+        &desired_runtime,
+        runtime_keys,
+        |tenant| app.maps.get_runtime_policy(tenant),
+        |tenant, policy| app.maps.upsert_runtime_policy(tenant, policy),
+        |tenant| app.maps.delete_runtime_policy(tenant),
+    )
+    .context("failed to reconcile RUNTIME_POLICY_MAP from persisted state")?;
+
+    Ok(snapshot_revision)
+}
+
+fn reconcile_policy_map<FGet, FUpsert, FDelete>(
+    desired: &BTreeMap<TenantKey, Policy>,
+    current_keys: Vec<TenantKey>,
+    mut get_policy: FGet,
+    mut upsert_policy: FUpsert,
+    mut delete_policy: FDelete,
+) -> Result<(), MapError>
+where
+    FGet: FnMut(TenantKey) -> Result<Option<Policy>, MapError>,
+    FUpsert: FnMut(TenantKey, Policy) -> Result<(), MapError>,
+    FDelete: FnMut(TenantKey) -> Result<(), MapError>,
+{
+    let current_set: BTreeSet<_> = current_keys.into_iter().collect();
+    for (&tenant, &policy) in desired {
+        let needs_upsert = if current_set.contains(&tenant) {
+            get_policy(tenant)? != Some(policy)
+        } else {
+            true
+        };
+        if needs_upsert {
+            upsert_policy(tenant, policy)?;
+        }
+    }
+
+    for tenant in current_set {
+        if !desired.contains_key(&tenant) {
+            delete_policy(tenant)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_reconcile_controller(
+    app: AppState,
+    mut shutdown_rx: watch::Receiver<bool>,
+    initial_reconciled_revision: u64,
+    reconcile_tick_ms: u64,
+    reconcile_deep_check_every_n: u64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let tick = Duration::from_millis(reconcile_tick_ms.max(1));
+        let deep_check_every = reconcile_deep_check_every_n.max(1);
+        let mut ticker = interval(tick);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut tick_index = 0_u64;
+        let mut last_reconciled_revision = initial_reconciled_revision;
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        Ok(()) if *shutdown_rx.borrow() => break,
+                        Ok(()) => {}
+                        Err(_) => break,
+                    }
+                }
+                _ = ticker.tick() => {
+                    tick_index = tick_index.saturating_add(1);
+                    let current_revision = app.state_store.revision();
+                    if !should_reconcile_tick(
+                        current_revision,
+                        last_reconciled_revision,
+                        tick_index,
+                        deep_check_every,
+                    ) {
+                        continue;
+                    }
+                    let deep_check_due = tick_index.is_multiple_of(deep_check_every);
+
+                    match reconcile_once(&app) {
+                        Ok(reconciled_revision) => {
+                            last_reconciled_revision = reconciled_revision;
+                        }
+                        Err(error) => {
+                            app.metrics.reconcile_failures_total.inc();
+                            warn!(
+                                error = %error,
+                                tick_index,
+                                deep_check_due,
+                                "reconcile tick failed; retaining prior state and retrying next tick"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+const fn should_reconcile_tick(
+    current_revision: u64,
+    last_reconciled_revision: u64,
+    tick_index: u64,
+    deep_check_every: u64,
+) -> bool {
+    current_revision != last_reconciled_revision || tick_index.is_multiple_of(deep_check_every)
 }
 
 fn setup_memlock_compatibility() {
@@ -321,11 +509,17 @@ fn build_metrics_state() -> anyhow::Result<MetricsState> {
         "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
     )?;
     registry.register(Box::new(partial_l7_policy_keys_total.clone()))?;
+    let reconcile_failures_total = IntCounter::new(
+        "vantage_reconcile_failures_total",
+        "Total number of non-fatal reconcile tick failures",
+    )?;
+    registry.register(Box::new(reconcile_failures_total.clone()))?;
 
     Ok(MetricsState {
         registry,
         daemon_up,
         partial_l7_policy_keys_total,
+        reconcile_failures_total,
     })
 }
 
@@ -381,7 +575,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, sync::Arc};
 
     use axum::extract::State;
     use aya::{
@@ -437,6 +631,10 @@ mod tests {
         }
 
         fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
             Ok(Vec::new())
         }
 
@@ -504,6 +702,11 @@ mod tests {
                     "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
                 )
                 .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                reconcile_failures_total: IntCounter::new(
+                    "vantage_reconcile_failures_total",
+                    "Total number of non-fatal reconcile tick failures",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
             state_store,
             tenancy: TenancyState::default(),
@@ -529,6 +732,107 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_policy_map_updates_only_missing_stale_and_extra_entries() {
+        let key_missing = TenantKey {
+            cgroup_id: 1,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let key_stale = TenantKey {
+            cgroup_id: 2,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let key_same = TenantKey {
+            cgroup_id: 3,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let key_extra = TenantKey {
+            cgroup_id: 4,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let desired_policy = Policy {
+            rate_tokens_per_sec: 10,
+            burst_tokens: 10,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let stale_policy = Policy {
+            rate_tokens_per_sec: 1,
+            burst_tokens: 1,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+
+        let mut desired = BTreeMap::new();
+        desired.insert(key_missing, desired_policy);
+        desired.insert(key_stale, desired_policy);
+        desired.insert(key_same, desired_policy);
+
+        let current = RefCell::new(BTreeMap::from([
+            (key_stale, stale_policy),
+            (key_same, desired_policy),
+            (key_extra, desired_policy),
+        ]));
+        let upserts: RefCell<Vec<TenantKey>> = RefCell::new(Vec::new());
+        let deletes: RefCell<Vec<TenantKey>> = RefCell::new(Vec::new());
+
+        let reconciled = super::reconcile_policy_map(
+            &desired,
+            vec![key_stale, key_same, key_extra],
+            |tenant| Ok(current.borrow().get(&tenant).copied()),
+            |tenant, policy| {
+                current.borrow_mut().insert(tenant, policy);
+                upserts.borrow_mut().push(tenant);
+                Ok(())
+            },
+            |tenant| {
+                let _ = current.borrow_mut().remove(&tenant);
+                deletes.borrow_mut().push(tenant);
+                Ok(())
+            },
+        );
+        assert!(
+            reconciled.is_ok(),
+            "reconcile should apply diff successfully"
+        );
+
+        let upserts = upserts.into_inner();
+        assert_eq!(upserts.len(), 2);
+        assert!(upserts.contains(&key_missing));
+        assert!(upserts.contains(&key_stale));
+        assert!(!upserts.contains(&key_same));
+
+        let deletes = deletes.into_inner();
+        assert_eq!(deletes, vec![key_extra]);
+    }
+
+    #[test]
+    fn should_reconcile_tick_when_revision_changes() {
+        assert!(super::should_reconcile_tick(5, 4, 1, 30));
+    }
+
+    #[test]
+    fn should_reconcile_tick_on_deep_check_interval_without_revision_change() {
+        assert!(super::should_reconcile_tick(7, 7, 30, 30));
+    }
+
+    #[test]
+    fn should_skip_tick_when_revision_unchanged_and_not_deep_check() {
+        assert!(!super::should_reconcile_tick(9, 9, 29, 30));
+    }
+
+    #[test]
     fn direction_name_reports_both() {
         let config = Config {
             iface: "lo".to_owned(),
@@ -550,6 +854,8 @@ mod tests {
                 throttle_rate_tokens_per_sec: 100,
                 throttle_burst_tokens: 500,
             },
+            reconcile_tick_ms: 1_000,
+            reconcile_deep_check_every_n: 30,
             essential_tenants: std::collections::BTreeSet::new(),
         };
         assert_eq!(direction_name(&config), "both");
@@ -577,6 +883,8 @@ mod tests {
                 throttle_rate_tokens_per_sec: 50,
                 throttle_burst_tokens: 250,
             },
+            reconcile_tick_ms: 1_000,
+            reconcile_deep_check_every_n: 30,
             essential_tenants: std::collections::BTreeSet::new(),
         };
         let state = test_state(
