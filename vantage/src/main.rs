@@ -5,6 +5,7 @@ pub mod events;
 pub mod map_client;
 pub mod metrics;
 pub mod prereqs;
+pub mod state_store;
 pub mod tenancy;
 pub mod tenant;
 
@@ -56,6 +57,7 @@ pub struct AppState {
     pub(crate) drop_events: DropEventRuntime,
     pub(crate) maps: MapClient,
     pub(crate) metrics: MetricsState,
+    pub(crate) state_store: state_store::StateStore,
     pub(crate) tenancy: TenancyState,
     pub(crate) adaptive_runtime: AdaptiveRuntimeState,
 }
@@ -86,9 +88,11 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Error)]
-pub enum AppError {
+pub(crate) enum AppError {
     #[error(transparent)]
     Runtime(#[from] anyhow::Error),
+    #[error(transparent)]
+    StateStore(#[from] state_store::StateStoreError),
 }
 
 impl IntoResponse for AppError {
@@ -107,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 pub(crate) async fn run(config: Config) -> Result<(), AppError> {
+    const DEFAULT_STATE_FILE_PATH: &str = "vantage-state.json";
     setup_memlock_compatibility();
     ensure_cgroup_v2_mounted().context(
         "host prerequisite check failed: cgroup-v2 must be mounted before starting vantage",
@@ -131,40 +136,12 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         );
     }
 
-    let metrics_state = build_metrics_state()?;
-    let drop_events = DropEventRuntime {
-        kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
-        log_sample_n: config.drop_event_log_sample_n,
-        log_enabled: config.drop_event_log_enabled,
-    };
-    let maps = MapClient::new(Arc::new(std::sync::Mutex::new(ebpf)));
-    maps.seed_global_config(config.global_config_seed().as_global_config())
-        .context("failed to seed GLOBAL_CONFIG_MAP startup state")?;
-    let state = AppState {
-        config: config.clone(),
-        drop_events,
-        maps,
-        metrics: metrics_state,
-        tenancy: TenancyState::new(config.essential_tenants.clone()),
-        adaptive_runtime: AdaptiveRuntimeState::default(),
-    };
-
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/policy/:tenant", put(put_policy).delete(delete_policy))
-        .route("/policy/:tenant/resolve", get(resolve_policy))
-        .route(
-            "/tenancy/:tenant/essential",
-            put(put_tenant_essential).get(tenant_essential),
-        )
-        .route(
-            "/admin/enabled",
-            put(put_admin_enabled).get(get_admin_enabled),
-        )
-        .route("/metrics", get(metrics))
-        .route("/debug/cpu-window", get(debug_cpu_window))
-        .route("/debug/snapshot", get(debug_snapshot))
-        .with_state(state.clone());
+    let state = build_app_state(&config, ebpf, DEFAULT_STATE_FILE_PATH)?;
+    let app = build_router(state.clone());
+    let flow_keys_live = state
+        .maps
+        .get_flow_keys_live()
+        .context("failed to read flow-keys mode from GLOBAL_CONFIG_MAP startup state")?;
     let adaptive_task = if config.adaptive.enabled {
         Some(spawn_adaptive_controller(
             state.clone(),
@@ -185,7 +162,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         drop_event_log_enabled = config.drop_event_log_enabled,
         drop_event_log_sample_n = config.drop_event_log_sample_n,
         metrics_dimensional_enabled = config.metrics_dimensions.enabled(),
-        flow_keys_live = config.flow_keys_mode.live(),
+        flow_keys_live,
         debug_top_tenants = config.debug_top_tenants,
         adaptive_enabled = config.adaptive.enabled,
         adaptive_high_watermark_percent = config.adaptive.high_watermark_percent,
@@ -210,6 +187,65 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn build_app_state(
+    config: &Config,
+    ebpf: Ebpf,
+    state_file_path: &str,
+) -> Result<AppState, AppError> {
+    let metrics_state = build_metrics_state()?;
+    let drop_events = DropEventRuntime {
+        kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
+        log_sample_n: config.drop_event_log_sample_n,
+        log_enabled: config.drop_event_log_enabled,
+    };
+    let global_seed = config.global_config_seed();
+    let defaults = state_store::StateStoreDefaults {
+        global_enabled: global_seed.enabled,
+        flow_keys_live: global_seed.flow_keys_live,
+        essential_tenants: config.essential_tenants.clone(),
+    };
+    let state_store = state_store::StateStore::load_or_init(state_file_path, &defaults)?;
+    let snapshot = state_store.snapshot()?;
+    let maps = MapClient::new(Arc::new(std::sync::Mutex::new(ebpf)));
+    maps.seed_global_config(
+        config::GlobalConfigSeed {
+            enabled: snapshot.global_enabled,
+            flow_keys_live: snapshot.flow_keys_live,
+        }
+        .as_global_config(),
+    )
+    .context("failed to seed GLOBAL_CONFIG_MAP startup state")?;
+
+    Ok(AppState {
+        config: config.clone(),
+        drop_events,
+        maps,
+        metrics: metrics_state,
+        state_store,
+        tenancy: TenancyState::new(snapshot.essential_tenants),
+        adaptive_runtime: AdaptiveRuntimeState::default(),
+    })
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+        .route("/policy/:tenant/resolve", get(resolve_policy))
+        .route(
+            "/tenancy/:tenant/essential",
+            put(put_tenant_essential).get(tenant_essential),
+        )
+        .route(
+            "/admin/enabled",
+            put(put_admin_enabled).get(get_admin_enabled),
+        )
+        .route("/metrics", get(metrics))
+        .route("/debug/cpu-window", get(debug_cpu_window))
+        .route("/debug/snapshot", get(debug_snapshot))
+        .with_state(state)
 }
 
 fn setup_memlock_compatibility() {
@@ -298,13 +334,23 @@ const fn direction_name(config: &Config) -> &'static str {
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
+    let flow_keys_live = match state.maps.get_flow_keys_live() {
+        Ok(flow_keys_live) => flow_keys_live,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to read live flow-keys mode for healthz; falling back to config value"
+            );
+            state.config.flow_keys_mode.live()
+        }
+    };
     Json(HealthResponse {
         status: "ok",
         iface: state.config.iface.clone(),
         direction: direction_name(&state.config),
         cpu_window_ms: state.config.cpu_window_ms,
         metrics_dimensional_enabled: state.config.metrics_dimensions.enabled(),
-        flow_keys_live: state.config.flow_keys_mode.live(),
+        flow_keys_live,
         debug_top_tenants: state.config.debug_top_tenants,
         adaptive_enabled: state.config.adaptive.enabled,
         adaptive_high_watermark_percent: state.config.adaptive.high_watermark_percent,
@@ -330,7 +376,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     use axum::extract::State;
     use aya::{
@@ -348,10 +394,13 @@ mod tests {
         adaptive::AdaptiveRuntimeState,
         config::Config,
         map_client::{MapClient, MapError, MapOps},
+        state_store::{StateStore, StateStoreDefaults},
         tenancy::TenancyState,
     };
 
-    struct NoopMapOps;
+    struct NoopMapOps {
+        flow_keys_live: bool,
+    }
 
     impl MapOps for NoopMapOps {
         fn upsert_policy(&self, _tenant: TenantKey, _policy: Policy) -> Result<(), MapError> {
@@ -421,7 +470,7 @@ mod tests {
         }
 
         fn get_flow_keys_live(&self) -> Result<bool, MapError> {
-            Ok(true)
+            Ok(self.flow_keys_live)
         }
     }
 
@@ -434,11 +483,14 @@ mod tests {
         daemon_up.set(1);
         let register = registry.register(Box::new(daemon_up.clone()));
         assert!(register.is_ok(), "metric registration should succeed");
+        let state_store = test_state_store("main_state");
+
+        let flow_keys_live = config.flow_keys_mode.live();
 
         AppState {
             config,
             drop_events,
-            maps: MapClient::from_ops(Arc::new(NoopMapOps)),
+            maps: MapClient::from_ops(Arc::new(NoopMapOps { flow_keys_live })),
             metrics: MetricsState {
                 registry,
                 daemon_up,
@@ -448,9 +500,27 @@ mod tests {
                 )
                 .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
+            state_store,
             tenancy: TenancyState::default(),
             adaptive_runtime: AdaptiveRuntimeState::default(),
         }
+    }
+
+    fn test_state_store(name: &str) -> StateStore {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "vantage_{name}_{}_{}.json",
+            std::process::id(),
+            stamp
+        ));
+        let defaults = StateStoreDefaults::default();
+        let loaded = StateStore::load_or_init(path, &defaults);
+        let Ok(store) = loaded else {
+            panic!("state store should initialize for tests");
+        };
+        store
     }
 
     #[test]

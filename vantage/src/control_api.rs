@@ -17,6 +17,7 @@ use crate::{
         CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async,
         sample_memory_percent_async,
     },
+    state_store::StateStoreError,
     tenancy::TenancyError,
     tenant::{
         FlowProto, TenantParseError, TenantRef, http_method_label, normalized_flow_key, proto_label,
@@ -248,6 +249,8 @@ pub(crate) enum ApiError {
     Metrics(#[from] MetricsError),
     #[error(transparent)]
     Tenancy(#[from] TenancyError),
+    #[error(transparent)]
+    StateStore(#[from] StateStoreError),
 }
 
 impl IntoResponse for ApiError {
@@ -267,6 +270,11 @@ impl IntoResponse for ApiError {
             Self::Tenancy(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("tenancy operation failed: {error}"),
+            )
+                .into_response(),
+            Self::StateStore(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("state store operation failed: {error}"),
             )
                 .into_response(),
         }
@@ -315,7 +323,25 @@ pub(crate) async fn put_policy(
         enabled: u8::from(req.enabled),
         _pad: [0; 7],
     };
-    maps.upsert_policy(tenant, policy)?;
+    let previous = app.state_store.upsert_base_policy(tenant, policy)?;
+    if let Err(error) = maps.upsert_policy(tenant, policy) {
+        let rollback = if let Some(previous_policy) = previous {
+            app.state_store
+                .upsert_base_policy(tenant, previous_policy)
+                .map(|_| ())
+        } else {
+            app.state_store.delete_base_policy(tenant).map(|_| ())
+        };
+        if let Err(rollback_error) = rollback {
+            warn!(
+                tenant = ?tenant,
+                error = %rollback_error,
+                "failed to rollback persisted base policy after map apply failure"
+            );
+            return Err(ApiError::StateStore(rollback_error));
+        }
+        return Err(ApiError::Map(error));
+    }
     let effective_for_stored = maps.resolve_policy(tenant)?.map_or_else(
         || ResolvedPolicyView {
             requested: tenant,
@@ -351,7 +377,18 @@ pub(crate) async fn put_admin_enabled(
     State(app): State<AppState>,
     Json(req): Json<PutEnabledRequest>,
 ) -> Result<StatusCode, ApiError> {
-    app.maps.set_global_enabled(req.enabled)?;
+    let previous = app.state_store.snapshot()?.global_enabled;
+    app.state_store.set_global_enabled(req.enabled)?;
+    if let Err(error) = app.maps.set_global_enabled(req.enabled) {
+        if let Err(rollback_error) = app.state_store.set_global_enabled(previous) {
+            warn!(
+                error = %rollback_error,
+                "failed to rollback persisted global enabled after map apply failure"
+            );
+            return Err(ApiError::StateStore(rollback_error));
+        }
+        return Err(ApiError::Map(error));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -378,7 +415,25 @@ pub(crate) async fn put_tenant_essential(
     Json(req): Json<PutEssentialRequest>,
 ) -> Result<Json<EssentialTenantResponse>, ApiError> {
     let cgroup_id = parse_tenant_cgroup_id(&tenant)?;
-    let _ = app.tenancy.set_essential(cgroup_id, req.essential)?;
+    let previous = app
+        .state_store
+        .snapshot()?
+        .essential_tenants
+        .contains(&cgroup_id);
+    let _ = app
+        .state_store
+        .set_essential_tenant(cgroup_id, req.essential)?;
+    if let Err(error) = app.tenancy.set_essential(cgroup_id, req.essential) {
+        if let Err(rollback_error) = app.state_store.set_essential_tenant(cgroup_id, previous) {
+            warn!(
+                tenant = cgroup_id,
+                error = %rollback_error,
+                "failed to rollback persisted essential flag after tenancy apply failure"
+            );
+            return Err(ApiError::StateStore(rollback_error));
+        }
+        return Err(ApiError::Tenancy(error));
+    }
 
     Ok(Json(EssentialTenantResponse {
         tenant: cgroup_id,
@@ -424,7 +479,20 @@ pub(crate) async fn delete_policy(
         .to_tenant_key();
     let maps = app.maps;
     let deleted = maps.get_policy(tenant)?.is_some();
-    maps.delete_policy(tenant)?;
+    let previous = app.state_store.delete_base_policy(tenant)?;
+    if let Err(error) = maps.delete_policy(tenant) {
+        if let Some(previous_policy) = previous
+            && let Err(rollback_error) = app.state_store.upsert_base_policy(tenant, previous_policy)
+        {
+            warn!(
+                tenant = ?tenant,
+                error = %rollback_error,
+                "failed to rollback persisted base policy after map delete failure"
+            );
+            return Err(ApiError::StateStore(rollback_error));
+        }
+        return Err(ApiError::Map(error));
+    }
     let effective_after_delete = maps.resolve_policy(tenant)?;
 
     Ok(Json(PolicyDeleteResponse {
@@ -608,6 +676,7 @@ fn build_top_tenants(counters: Vec<(TenantKey, Counters)>, limit: usize) -> Vec<
 mod tests {
     use std::{
         collections::BTreeMap,
+        path::PathBuf,
         sync::{Arc, Mutex},
     };
 
@@ -634,6 +703,7 @@ mod tests {
         adaptive::AdaptiveRuntimeState,
         config::{Config, PolicyValidationMode},
         map_client::{MapClient, MapError, MapOps},
+        state_store::{StateStore, StateStoreDefaults},
         tenancy::TenancyState,
         tenant::compute_http_path_hash,
     };
@@ -818,6 +888,7 @@ mod tests {
             register_partial.is_ok(),
             "partial-l7 metric registration should succeed"
         );
+        let state_store = test_state_store("control_api_state");
 
         AppState {
             config: Config {
@@ -853,9 +924,27 @@ mod tests {
                 daemon_up,
                 partial_l7_policy_keys_total,
             },
+            state_store,
             tenancy: TenancyState::default(),
             adaptive_runtime: AdaptiveRuntimeState::default(),
         }
+    }
+
+    fn test_state_store(name: &str) -> StateStore {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "vantage_{name}_{}_{}.json",
+            std::process::id(),
+            stamp
+        ));
+        let defaults = StateStoreDefaults::default();
+        let loaded = StateStore::load_or_init(path, &defaults);
+        let Ok(store) = loaded else {
+            panic!("state store should initialize for tests");
+        };
+        store
     }
 
     fn fixture_snapshot_maps() -> MapClient {

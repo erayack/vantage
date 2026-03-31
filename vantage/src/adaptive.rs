@@ -16,6 +16,7 @@ use crate::{
     AppState,
     map_client::MapError,
     metrics::{MetricsError, sample_host_load_window_async},
+    state_store::StateStoreError,
     tenancy::TenancyError,
 };
 
@@ -27,6 +28,8 @@ enum AdaptiveError {
     Metrics(#[from] MetricsError),
     #[error(transparent)]
     Tenancy(#[from] TenancyError),
+    #[error(transparent)]
+    StateStore(#[from] StateStoreError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
@@ -165,7 +168,12 @@ fn reconcile_managed_overrides(
         if target.contains(&key) {
             continue;
         }
-        app.maps.delete_runtime_policy(key)?;
+        let removed = app
+            .state_store
+            .delete_runtime_override_if_owner(key, crate::state_store::RuntimeOwner::Adaptive)?;
+        if removed {
+            app.maps.delete_runtime_policy(key)?;
+        }
         to_remove.push(key);
     }
 
@@ -178,8 +186,13 @@ fn reconcile_managed_overrides(
         if managed_overrides.contains(&key) {
             continue;
         }
-        app.maps.upsert_runtime_policy(key, policy)?;
-        managed_overrides.insert(key);
+        let stored = app
+            .state_store
+            .upsert_adaptive_runtime_override(key, policy)?;
+        if stored {
+            app.maps.upsert_runtime_policy(key, policy)?;
+            managed_overrides.insert(key);
+        }
     }
 
     Ok(())
@@ -191,8 +204,13 @@ fn clear_managed_overrides(
 ) -> Result<(), AdaptiveError> {
     let to_remove: Vec<_> = managed_overrides.iter().copied().collect();
     for key in to_remove {
-        app.maps.delete_runtime_policy(key)?;
-        managed_overrides.remove(&key);
+        let removed = app
+            .state_store
+            .delete_runtime_override_if_owner(key, crate::state_store::RuntimeOwner::Adaptive)?;
+        if removed {
+            app.maps.delete_runtime_policy(key)?;
+        }
+        let _ = managed_overrides.remove(&key);
     }
     Ok(())
 }

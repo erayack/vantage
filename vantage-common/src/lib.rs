@@ -173,6 +173,7 @@ pub const KERNEL_DROP_EVENT_SAMPLE_EVERY: u64 = 64;
 
 #[repr(C)]
 #[allow(clippy::pub_underscore_fields)]
+#[cfg_attr(feature = "user", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub rate_tokens_per_sec: u64,
