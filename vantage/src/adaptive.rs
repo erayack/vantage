@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -16,7 +16,7 @@ use crate::{
     AppState,
     map_client::MapError,
     metrics::{MetricsError, sample_host_load_window_async},
-    state_store::StateStoreError,
+    state_store::{AdaptiveUpsertOutcome, RuntimeOwner, StateStoreError},
     tenancy::TenancyError,
 };
 
@@ -162,6 +162,8 @@ fn reconcile_managed_overrides(
     managed_overrides: &mut BTreeSet<TenantKey>,
 ) -> Result<(), AdaptiveError> {
     let target = target_override_keys(app)?;
+    let snapshot = app.state_store.snapshot()?;
+    refresh_managed_overrides_from_snapshot(&snapshot.runtime_overrides, managed_overrides);
     let mut to_remove = Vec::new();
 
     for key in managed_overrides.iter().copied() {
@@ -170,7 +172,7 @@ fn reconcile_managed_overrides(
         }
         let removed = app
             .state_store
-            .delete_runtime_override_if_owner(key, crate::state_store::RuntimeOwner::Adaptive)?;
+            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive)?;
         if removed {
             app.maps.delete_runtime_policy(key)?;
         }
@@ -183,15 +185,28 @@ fn reconcile_managed_overrides(
 
     let policy = throttle_policy(app);
     for key in target {
+        if snapshot
+            .runtime_overrides
+            .get(&key)
+            .is_some_and(|entry| entry.owner == RuntimeOwner::Manual)
+        {
+            continue;
+        }
+
         if managed_overrides.contains(&key) {
             continue;
         }
-        let stored = app
+        let outcome = app
             .state_store
             .upsert_adaptive_runtime_override(key, policy)?;
-        if stored {
-            app.maps.upsert_runtime_policy(key, policy)?;
-            managed_overrides.insert(key);
+        match outcome {
+            AdaptiveUpsertOutcome::Applied => {
+                app.maps.upsert_runtime_policy(key, policy)?;
+                managed_overrides.insert(key);
+            }
+            AdaptiveUpsertOutcome::SkippedManualOwner => {
+                let _ = managed_overrides.remove(&key);
+            }
         }
     }
 
@@ -206,13 +221,30 @@ fn clear_managed_overrides(
     for key in to_remove {
         let removed = app
             .state_store
-            .delete_runtime_override_if_owner(key, crate::state_store::RuntimeOwner::Adaptive)?;
+            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive)?;
         if removed {
             app.maps.delete_runtime_policy(key)?;
         }
         let _ = managed_overrides.remove(&key);
     }
     Ok(())
+}
+
+fn refresh_managed_overrides_from_snapshot(
+    overrides: &BTreeMap<TenantKey, crate::state_store::RuntimeOverrideRecord>,
+    managed_overrides: &mut BTreeSet<TenantKey>,
+) {
+    managed_overrides.retain(|key| {
+        overrides
+            .get(key)
+            .is_some_and(|entry| entry.owner == RuntimeOwner::Adaptive)
+    });
+
+    for (&key, entry) in overrides {
+        if entry.owner == RuntimeOwner::Adaptive {
+            managed_overrides.insert(key);
+        }
+    }
 }
 
 fn target_override_keys(app: &AppState) -> Result<BTreeSet<TenantKey>, AdaptiveError> {

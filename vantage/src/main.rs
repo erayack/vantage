@@ -35,8 +35,9 @@ use crate::{
     adaptive::{AdaptiveRuntimeState, spawn_adaptive_controller},
     config::Config,
     control_api::{
-        debug_cpu_window, debug_snapshot, delete_policy, get_admin_enabled, metrics,
-        put_admin_enabled, put_policy, put_tenant_essential, resolve_policy, tenant_essential,
+        debug_cpu_window, debug_snapshot, delete_policy, delete_runtime_policy, get_admin_enabled,
+        metrics, put_admin_enabled, put_policy, put_runtime_policy, put_tenant_essential,
+        resolve_policy, tenant_essential,
     },
     events::{spawn_drop_event_consumer, take_drop_event_ring},
     map_client::MapClient,
@@ -233,6 +234,10 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+        .route(
+            "/runtime-policy/:tenant",
+            put(put_runtime_policy).delete(delete_runtime_policy),
+        )
         .route("/policy/:tenant/resolve", get(resolve_policy))
         .route(
             "/tenancy/:tenant/essential",

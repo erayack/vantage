@@ -17,7 +17,7 @@ use crate::{
         CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async,
         sample_memory_percent_async,
     },
-    state_store::StateStoreError,
+    state_store::{RuntimeDeleteMode, RuntimeOwner, StateStoreError},
     tenancy::TenancyError,
     tenant::{
         FlowProto, TenantParseError, TenantRef, http_method_label, normalized_flow_key, proto_label,
@@ -64,6 +64,17 @@ pub(crate) struct ResolvePolicyQuery {
     pub http_method: Option<String>,
     pub http_path: Option<String>,
     pub http_path_hash: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct DeleteRuntimePolicyQuery {
+    pub proto: Option<String>,
+    pub dst_port: Option<u16>,
+    pub http_method: Option<String>,
+    pub http_path: Option<String>,
+    pub http_path_hash: Option<u32>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +151,30 @@ pub(crate) struct PolicyDeleteResponse {
     pub deleted_key: TenantKey,
     pub deleted_selector: SelectorView,
     pub deleted_flow: String,
+    pub precedence: &'static str,
+    pub effective_after_delete: Option<ResolvedPolicyView>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimePolicyUpsertResponse {
+    pub stored: TenantKey,
+    pub scope: PolicyMatchLevel,
+    pub stored_selector: SelectorView,
+    pub stored_flow: String,
+    pub owner: RuntimeOwner,
+    pub precedence: &'static str,
+    pub effective_for_stored: ResolvedPolicyView,
+    pub warnings: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimePolicyDeleteResponse {
+    pub deleted: bool,
+    pub force: bool,
+    pub deleted_key: TenantKey,
+    pub deleted_selector: SelectorView,
+    pub deleted_flow: String,
+    pub owner_before: Option<RuntimeOwner>,
     pub precedence: &'static str,
     pub effective_after_delete: Option<ResolvedPolicyView>,
 }
@@ -368,6 +403,86 @@ pub(crate) async fn put_policy(
     }))
 }
 
+/// Upserts a manual runtime override policy into `RUNTIME_POLICY_MAP`.
+///
+/// # Errors
+///
+/// Returns `ApiError` when map lookup/update fails.
+pub(crate) async fn put_runtime_policy(
+    Path(tenant): Path<String>,
+    State(app): State<AppState>,
+    Json(req): Json<PutPolicyRequest>,
+) -> Result<Json<RuntimePolicyUpsertResponse>, ApiError> {
+    let proto = parse_proto(req.proto.as_deref())?;
+    let tenant = TenantRef::parse(&tenant)?
+        .with_flow(proto, req.dst_port)?
+        .with_http_selectors(
+            req.http_method.as_deref(),
+            req.http_path.as_deref(),
+            req.http_path_hash,
+        )?
+        .to_tenant_key();
+    let mut warnings = Vec::new();
+    if partial_l7_policy_key(tenant) {
+        app.metrics.partial_l7_policy_keys_total.inc();
+        if app.config.policy_validation_mode.strict() {
+            return Err(ApiError::Tenant(
+                TenantParseError::PartialL7SelectorsRequireFlow,
+            ));
+        }
+
+        warnings.push(PARTIAL_L7_POLICY_WARNING);
+        warn!(
+            tenant = ?tenant,
+            policy_validation_mode = ?app.config.policy_validation_mode,
+            "accepted partial-l7 runtime-policy key with wildcard l4 selectors"
+        );
+    }
+    let policy = Policy {
+        rate_tokens_per_sec: req.rate_tokens_per_sec,
+        burst_tokens: req.burst_tokens,
+        enabled: u8::from(req.enabled),
+        _pad: [0; 7],
+    };
+    let _ = app
+        .state_store
+        .upsert_manual_runtime_override(tenant, policy)?;
+    if let Err(error) = app.maps.upsert_runtime_policy(tenant, policy) {
+        warn!(
+            tenant = ?tenant,
+            error = %error,
+            "runtime override map apply failed after persisted update; reconcile will retry"
+        );
+        return Err(ApiError::Map(error));
+    }
+
+    let effective_for_stored = app.maps.resolve_policy(tenant)?.map_or_else(
+        || ResolvedPolicyView {
+            requested: tenant,
+            matched: tenant,
+            requested_selector: SelectorView::from_tenant(tenant),
+            matched_selector: SelectorView::from_tenant(tenant),
+            match_level: PolicyMatchLevel::Exact,
+            source: PolicySource::RuntimeOverride,
+            requested_flow: normalized_flow_key(tenant),
+            matched_flow: normalized_flow_key(tenant),
+            policy: policy.into(),
+        },
+        Into::into,
+    );
+
+    Ok(Json(RuntimePolicyUpsertResponse {
+        stored: tenant,
+        scope: policy_scope_from_key(tenant),
+        stored_selector: SelectorView::from_tenant(tenant),
+        stored_flow: normalized_flow_key(tenant),
+        owner: RuntimeOwner::Manual,
+        precedence: policy_precedence_contract(),
+        effective_for_stored,
+        warnings,
+    }))
+}
+
 /// Sets global data-path enabled state in `GLOBAL_CONFIG_MAP[0]`.
 ///
 /// # Errors
@@ -500,6 +615,58 @@ pub(crate) async fn delete_policy(
         deleted_key: tenant,
         deleted_selector: SelectorView::from_tenant(tenant),
         deleted_flow: normalized_flow_key(tenant),
+        precedence: policy_precedence_contract(),
+        effective_after_delete: effective_after_delete.map(Into::into),
+    }))
+}
+
+/// Deletes a runtime override policy from `RUNTIME_POLICY_MAP` with explicit force semantics.
+///
+/// # Errors
+///
+/// Returns `ApiError` when map lookup/delete fails.
+pub(crate) async fn delete_runtime_policy(
+    Path(tenant): Path<String>,
+    Query(query): Query<DeleteRuntimePolicyQuery>,
+    State(app): State<AppState>,
+) -> Result<Json<RuntimePolicyDeleteResponse>, ApiError> {
+    let proto = parse_proto(query.proto.as_deref())?;
+    let tenant = TenantRef::parse(&tenant)?
+        .with_flow(proto, query.dst_port)?
+        .with_http_selectors(
+            query.http_method.as_deref(),
+            query.http_path.as_deref(),
+            query.http_path_hash,
+        )?
+        .to_tenant_key();
+
+    let delete_mode = if query.force {
+        RuntimeDeleteMode::AnyOwner
+    } else {
+        RuntimeDeleteMode::ManualOnly
+    };
+    let deleted_record = app
+        .state_store
+        .delete_runtime_override_with_mode(tenant, delete_mode)?;
+    if deleted_record.is_some()
+        && let Err(error) = app.maps.delete_runtime_policy(tenant)
+    {
+        warn!(
+            tenant = ?tenant,
+            error = %error,
+            "runtime override map delete failed after persisted update; reconcile will retry"
+        );
+        return Err(ApiError::Map(error));
+    }
+    let effective_after_delete = app.maps.resolve_policy(tenant)?;
+
+    Ok(Json(RuntimePolicyDeleteResponse {
+        deleted: deleted_record.is_some(),
+        force: query.force,
+        deleted_key: tenant,
+        deleted_selector: SelectorView::from_tenant(tenant),
+        deleted_flow: normalized_flow_key(tenant),
+        owner_before: deleted_record.map(|record| record.owner),
         precedence: policy_precedence_contract(),
         effective_after_delete: effective_after_delete.map(Into::into),
     }))
@@ -695,15 +862,15 @@ mod tests {
 
     use super::{
         PARTIAL_L7_POLICY_WARNING, build_top_tenants, debug_cpu_window, debug_snapshot,
-        delete_policy, get_admin_enabled, metrics, put_admin_enabled, put_policy,
-        put_tenant_essential, resolve_policy, tenant_essential,
+        delete_policy, delete_runtime_policy, get_admin_enabled, metrics, put_admin_enabled,
+        put_policy, put_runtime_policy, put_tenant_essential, resolve_policy, tenant_essential,
     };
     use crate::{
         AppState, DropEventRuntime, MetricsState,
         adaptive::AdaptiveRuntimeState,
         config::{Config, PolicyValidationMode},
         map_client::{MapClient, MapError, MapOps},
-        state_store::{StateStore, StateStoreDefaults},
+        state_store::{AdaptiveUpsertOutcome, RuntimeOwner, StateStore, StateStoreDefaults},
         tenancy::TenancyState,
         tenant::compute_http_path_hash,
     };
@@ -1113,6 +1280,201 @@ mod tests {
             serde_json::json!(null)
         );
         assert_eq!(payload["warnings"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn put_runtime_policy_stores_manual_owner() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let state = test_state(maps.clone());
+        let store = state.state_store.clone();
+        let app = Router::new()
+            .route(
+                "/runtime-policy/:tenant",
+                put(put_runtime_policy).delete(delete_runtime_policy),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/runtime-policy/42")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let snapshot = store.snapshot();
+        let Ok(snapshot) = snapshot else {
+            panic!("snapshot should succeed");
+        };
+        let stored = snapshot.runtime_overrides.get(&TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        });
+        let Some(stored) = stored else {
+            panic!("runtime override should be persisted");
+        };
+        assert_eq!(stored.owner, RuntimeOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn delete_runtime_policy_requires_force_for_adaptive_owner() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let state = test_state(maps.clone());
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 10,
+            burst_tokens: 20,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let inserted = store.upsert_adaptive_runtime_override(tenant, policy);
+        let Ok(inserted) = inserted else {
+            panic!("adaptive runtime override should persist");
+        };
+        assert_eq!(inserted, AdaptiveUpsertOutcome::Applied);
+        let map_upsert = maps.upsert_runtime_policy(tenant, policy);
+        assert!(map_upsert.is_ok(), "runtime map insert should succeed");
+
+        let app = Router::new()
+            .route(
+                "/runtime-policy/:tenant",
+                put(put_runtime_policy).delete(delete_runtime_policy),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/runtime-policy/42")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(payload["deleted"], serde_json::json!(false));
+        assert_eq!(payload["force"], serde_json::json!(false));
+        assert_eq!(payload["owner_before"], serde_json::json!(null));
+
+        let snapshot = store.snapshot();
+        let Ok(snapshot) = snapshot else {
+            panic!("snapshot should succeed");
+        };
+        assert_eq!(
+            snapshot
+                .runtime_overrides
+                .get(&tenant)
+                .map(|record| record.owner),
+            Some(RuntimeOwner::Adaptive)
+        );
+        let runtime_map = maps.get_runtime_policy(tenant);
+        let Ok(runtime_map) = runtime_map else {
+            panic!("runtime map read should succeed");
+        };
+        assert_eq!(runtime_map, Some(policy));
+    }
+
+    #[tokio::test]
+    async fn delete_runtime_policy_force_removes_adaptive_owner() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let state = test_state(maps.clone());
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 10,
+            burst_tokens: 20,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let inserted = store.upsert_adaptive_runtime_override(tenant, policy);
+        let Ok(inserted) = inserted else {
+            panic!("adaptive runtime override should persist");
+        };
+        assert_eq!(inserted, AdaptiveUpsertOutcome::Applied);
+        let map_upsert = maps.upsert_runtime_policy(tenant, policy);
+        assert!(map_upsert.is_ok(), "runtime map insert should succeed");
+
+        let app = Router::new()
+            .route(
+                "/runtime-policy/:tenant",
+                put(put_runtime_policy).delete(delete_runtime_policy),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/runtime-policy/42?force=true")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(payload["deleted"], serde_json::json!(true));
+        assert_eq!(payload["force"], serde_json::json!(true));
+        assert_eq!(payload["owner_before"], serde_json::json!("adaptive"));
+
+        let snapshot = store.snapshot();
+        let Ok(snapshot) = snapshot else {
+            panic!("snapshot should succeed");
+        };
+        assert!(
+            !snapshot.runtime_overrides.contains_key(&tenant),
+            "runtime override should be removed from state store"
+        );
+        let runtime_map = maps.get_runtime_policy(tenant);
+        let Ok(runtime_map) = runtime_map else {
+            panic!("runtime map read should succeed");
+        };
+        assert_eq!(runtime_map, None);
     }
 
     #[tokio::test]
