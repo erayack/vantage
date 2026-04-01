@@ -1231,6 +1231,7 @@ mod tests {
             config: Config {
                 iface: "lo".to_owned(),
                 bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+                state_file_path: PathBuf::from("./vantage-state.json"),
                 attach_ingress: true,
                 attach_egress: false,
                 drop_event_log_sample_n: 1,

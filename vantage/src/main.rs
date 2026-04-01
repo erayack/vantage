@@ -122,7 +122,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 pub(crate) async fn run(config: Config) -> Result<(), AppError> {
-    const DEFAULT_STATE_FILE_PATH: &str = "vantage-state.json";
     setup_memlock_compatibility();
     ensure_cgroup_v2_mounted().context(
         "host prerequisite check failed: cgroup-v2 must be mounted before starting vantage",
@@ -143,7 +142,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         None
     };
 
-    let state = build_app_state(&config, ebpf, DEFAULT_STATE_FILE_PATH)?;
+    let state = build_app_state(&config, ebpf)?;
     let initial_reconciled_revision = reconcile_once(&state)
         .context("failed to complete startup reconcile before serving traffic")?;
     if let Some(ring_buf) = drop_event_ring {
@@ -195,6 +194,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
         adaptive_throttle_burst_tokens = config.adaptive.throttle_burst_tokens,
         reconcile_tick_ms = config.reconcile_tick_ms,
         reconcile_deep_check_every_n = config.reconcile_deep_check_every_n,
+        state_file_path = %config.state_file_path.display(),
         kernel_drop_event_sample_every = KERNEL_DROP_EVENT_SAMPLE_EVERY,
         "vantage daemon started"
     );
@@ -218,11 +218,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     Ok(())
 }
 
-fn build_app_state(
-    config: &Config,
-    ebpf: Ebpf,
-    state_file_path: &str,
-) -> Result<AppState, AppError> {
+fn build_app_state(config: &Config, ebpf: Ebpf) -> Result<AppState, AppError> {
     let metrics_state = build_metrics_state()?;
     let drop_events = DropEventRuntime {
         kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
@@ -235,7 +231,7 @@ fn build_app_state(
         flow_keys_live: global_seed.flow_keys_live,
         essential_tenants: config.essential_tenants.clone(),
     };
-    let state_store = state_store::StateStore::load_or_init(state_file_path, &defaults)?;
+    let state_store = state_store::StateStore::load_or_init(&config.state_file_path, &defaults)?;
     let snapshot = state_store.snapshot()?;
     let maps = MapClient::new(Arc::new(std::sync::Mutex::new(ebpf)));
     maps.seed_global_config(
@@ -394,7 +390,7 @@ fn spawn_reconcile_controller(
     reconcile_deep_check_every_n: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let tick = Duration::from_millis(reconcile_tick_ms.max(1));
+        let tick = Duration::from_millis(reconcile_tick_ms.max(100));
         let deep_check_every = reconcile_deep_check_every_n.max(1);
         let mut ticker = interval(tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -852,6 +848,7 @@ mod tests {
         let config = Config {
             iface: "lo".to_owned(),
             bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+            state_file_path: PathBuf::from("./vantage-state.json"),
             attach_ingress: true,
             attach_egress: true,
             drop_event_log_sample_n: 5,
@@ -881,6 +878,7 @@ mod tests {
         let config = Config {
             iface: "lo".to_owned(),
             bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+            state_file_path: PathBuf::from("./vantage-state.json"),
             attach_ingress: true,
             attach_egress: false,
             drop_event_log_sample_n: 5,

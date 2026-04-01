@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::SocketAddr, num::ParseIntError};
+use std::{collections::BTreeSet, net::SocketAddr, num::ParseIntError, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use vantage_common::GlobalConfig;
@@ -70,6 +70,13 @@ struct Cli {
     direction: AttachDirection,
     #[arg(long, default_value = "127.0.0.1:3000", env = "VANTAGE_BIND_ADDR")]
     bind_addr: SocketAddr,
+    #[arg(
+        long = "state-file-path",
+        default_value = "./vantage-state.json",
+        env = "VANTAGE_STATE_FILE_PATH",
+        value_parser = parse_state_file_path
+    )]
+    state_file_path: PathBuf,
     #[arg(
         long = "drop-event-sample-n",
         alias = "drop-event-log-sample-n",
@@ -144,7 +151,7 @@ struct Cli {
     adaptive_throttle_burst_tokens: u64,
     #[arg(
         long = "reconcile-tick-ms",
-        default_value_t = 1_000_u64,
+        default_value_t = 2_000_u64,
         env = "VANTAGE_RECONCILE_TICK_MS"
     )]
     reconcile_tick_ms: u64,
@@ -167,6 +174,7 @@ struct Cli {
 pub(crate) struct Config {
     pub(crate) iface: String,
     pub(crate) bind_addr: SocketAddr,
+    pub(crate) state_file_path: PathBuf,
     pub(crate) attach_ingress: bool,
     pub(crate) attach_egress: bool,
     pub(crate) drop_event_log_sample_n: u32,
@@ -228,6 +236,7 @@ impl Config {
         Self {
             iface: cli.iface,
             bind_addr: cli.bind_addr,
+            state_file_path: cli.state_file_path,
             attach_ingress,
             attach_egress,
             drop_event_log_sample_n: cli.drop_event_log_sample_n.max(1),
@@ -249,7 +258,7 @@ impl Config {
                 throttle_rate_tokens_per_sec: cli.adaptive_throttle_rate_tokens_per_sec.max(1),
                 throttle_burst_tokens: cli.adaptive_throttle_burst_tokens.max(1),
             },
-            reconcile_tick_ms: cli.reconcile_tick_ms.max(1),
+            reconcile_tick_ms: cli.reconcile_tick_ms.max(100),
             reconcile_deep_check_every_n: cli.reconcile_deep_check_every_n.max(1),
             essential_tenants: cli.essential_tenants.into_iter().collect(),
         }
@@ -271,14 +280,27 @@ fn parse_essential_tenant(raw: &str) -> Result<u64, String> {
         .map_err(|error: ParseIntError| format!("invalid essential tenant '{raw}': {error}"))
 }
 
+fn parse_state_file_path(raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("state file path must not be empty".to_owned());
+    }
+    Ok(PathBuf::from(raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, MetricsDimensions, PolicyValidationMode};
 
+    fn parse_config<const N: usize>(args: [&str; N]) -> Result<Config, clap::Error> {
+        temp_env::with_var("VANTAGE_STATE_FILE_PATH", None::<&str>, || {
+            Config::try_from_iter(args)
+        })
+    }
+
     #[test]
     fn attach_direction_from_env_is_respected() {
         temp_env::with_var("VANTAGE_ATTACH_DIRECTION", Some("both"), || {
-            let parsed = Config::try_from_iter(["vantage"]);
+            let parsed = parse_config(["vantage"]);
             let Ok(config) = parsed else {
                 panic!("config parsing should succeed");
             };
@@ -290,7 +312,7 @@ mod tests {
     #[test]
     fn default_direction_is_ingress_only() {
         temp_env::with_var("VANTAGE_ATTACH_DIRECTION", None::<&str>, || {
-            let parsed = Config::try_from_iter(["vantage"]);
+            let parsed = parse_config(["vantage"]);
             let Ok(config) = parsed else {
                 panic!("config parsing should succeed");
             };
@@ -301,7 +323,7 @@ mod tests {
 
     #[test]
     fn drop_event_sample_is_clamped_to_one() {
-        let parsed = Config::try_from_iter(["vantage", "--drop-event-sample-n", "0"]);
+        let parsed = parse_config(["vantage", "--drop-event-sample-n", "0"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -311,7 +333,7 @@ mod tests {
     #[test]
     fn cli_flag_overrides_env_value() {
         temp_env::with_var("VANTAGE_ATTACH_DIRECTION", Some("egress"), || {
-            let parsed = Config::try_from_iter(["vantage", "--direction", "ingress"]);
+            let parsed = parse_config(["vantage", "--direction", "ingress"]);
             let Ok(config) = parsed else {
                 panic!("config parsing should succeed");
             };
@@ -322,7 +344,7 @@ mod tests {
 
     #[test]
     fn cpu_window_ms_uses_default() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -331,7 +353,7 @@ mod tests {
 
     #[test]
     fn cpu_window_ms_is_clamped_to_one() {
-        let parsed = Config::try_from_iter(["vantage", "--cpu-window-ms", "0"]);
+        let parsed = parse_config(["vantage", "--cpu-window-ms", "0"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -339,8 +361,60 @@ mod tests {
     }
 
     #[test]
+    fn state_file_path_uses_default() {
+        let parsed = parse_config(["vantage"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(
+            config.state_file_path,
+            std::path::PathBuf::from("./vantage-state.json")
+        );
+    }
+
+    #[test]
+    fn state_file_path_can_be_overridden_by_flag() {
+        let parsed = parse_config(["vantage", "--state-file-path", "./custom-state.json"]);
+        let Ok(config) = parsed else {
+            panic!("config parsing should succeed");
+        };
+        assert_eq!(
+            config.state_file_path,
+            std::path::PathBuf::from("./custom-state.json")
+        );
+    }
+
+    #[test]
+    fn state_file_path_can_be_overridden_by_env() {
+        temp_env::with_var("VANTAGE_STATE_FILE_PATH", Some("./env-state.json"), || {
+            let parsed = Config::try_from_iter(["vantage"]);
+            let Ok(config) = parsed else {
+                panic!("config parsing should succeed");
+            };
+            assert_eq!(
+                config.state_file_path,
+                std::path::PathBuf::from("./env-state.json")
+            );
+        });
+    }
+
+    #[test]
+    fn empty_state_file_path_is_rejected() {
+        let parsed = parse_config(["vantage", "--state-file-path", ""]);
+        assert!(parsed.is_err(), "empty state file path should fail parsing");
+    }
+
+    #[test]
+    fn empty_state_file_path_from_env_is_rejected() {
+        temp_env::with_var("VANTAGE_STATE_FILE_PATH", Some(""), || {
+            let parsed = Config::try_from_iter(["vantage"]);
+            assert!(parsed.is_err(), "empty state file path should fail parsing");
+        });
+    }
+
+    #[test]
     fn debug_top_tenants_uses_default() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -349,7 +423,7 @@ mod tests {
 
     #[test]
     fn debug_top_tenants_is_clamped_to_upper_bound() {
-        let parsed = Config::try_from_iter(["vantage", "--debug-top-tenants", "500"]);
+        let parsed = parse_config(["vantage", "--debug-top-tenants", "500"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -358,7 +432,7 @@ mod tests {
 
     #[test]
     fn debug_top_tenants_is_clamped_to_lower_bound() {
-        let parsed = Config::try_from_iter(["vantage", "--debug-top-tenants", "0"]);
+        let parsed = parse_config(["vantage", "--debug-top-tenants", "0"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -367,7 +441,7 @@ mod tests {
 
     #[test]
     fn metrics_dimensions_can_be_enabled() {
-        let parsed = Config::try_from_iter(["vantage", "--metrics-dimensional-enabled"]);
+        let parsed = parse_config(["vantage", "--metrics-dimensional-enabled"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -376,7 +450,7 @@ mod tests {
 
     #[test]
     fn flow_keys_mode_defaults_to_live() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -385,7 +459,7 @@ mod tests {
 
     #[test]
     fn flow_keys_mode_can_disable_flow_keys() {
-        let parsed = Config::try_from_iter(["vantage", "--flow-keys-mode", "legacy"]);
+        let parsed = parse_config(["vantage", "--flow-keys-mode", "legacy"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -394,7 +468,7 @@ mod tests {
 
     #[test]
     fn policy_validation_mode_defaults_to_permissive() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -406,7 +480,7 @@ mod tests {
 
     #[test]
     fn policy_validation_mode_can_be_set_to_strict() {
-        let parsed = Config::try_from_iter(["vantage", "--policy-validation-mode", "strict"]);
+        let parsed = parse_config(["vantage", "--policy-validation-mode", "strict"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -416,7 +490,7 @@ mod tests {
 
     #[test]
     fn adaptive_config_defaults_are_set() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -430,7 +504,7 @@ mod tests {
 
     #[test]
     fn adaptive_tick_ms_is_clamped_to_one() {
-        let parsed = Config::try_from_iter(["vantage", "--adaptive-tick-ms", "0"]);
+        let parsed = parse_config(["vantage", "--adaptive-tick-ms", "0"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -439,7 +513,7 @@ mod tests {
 
     #[test]
     fn adaptive_throttle_values_are_clamped_to_one() {
-        let parsed = Config::try_from_iter([
+        let parsed = parse_config([
             "vantage",
             "--adaptive-throttle-rate-tokens-per-sec",
             "0",
@@ -455,17 +529,17 @@ mod tests {
 
     #[test]
     fn reconcile_defaults_are_set() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
-        assert_eq!(config.reconcile_tick_ms, 1_000);
+        assert_eq!(config.reconcile_tick_ms, 2_000);
         assert_eq!(config.reconcile_deep_check_every_n, 30);
     }
 
     #[test]
-    fn reconcile_values_are_clamped_to_one() {
-        let parsed = Config::try_from_iter([
+    fn reconcile_values_are_clamped_to_minimums() {
+        let parsed = parse_config([
             "vantage",
             "--reconcile-tick-ms",
             "0",
@@ -475,13 +549,13 @@ mod tests {
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
-        assert_eq!(config.reconcile_tick_ms, 1);
+        assert_eq!(config.reconcile_tick_ms, 100);
         assert_eq!(config.reconcile_deep_check_every_n, 1);
     }
 
     #[test]
     fn adaptive_high_watermark_is_clamped_to_hundred() {
-        let parsed = Config::try_from_iter(["vantage", "--adaptive-high-watermark-percent", "255"]);
+        let parsed = parse_config(["vantage", "--adaptive-high-watermark-percent", "255"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -490,7 +564,7 @@ mod tests {
 
     #[test]
     fn adaptive_high_watermark_is_clamped_to_minimum_two() {
-        let parsed = Config::try_from_iter(["vantage", "--adaptive-high-watermark-percent", "1"]);
+        let parsed = parse_config(["vantage", "--adaptive-high-watermark-percent", "1"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -499,7 +573,7 @@ mod tests {
 
     #[test]
     fn adaptive_low_watermark_is_clamped_below_high() {
-        let parsed = Config::try_from_iter([
+        let parsed = parse_config([
             "vantage",
             "--adaptive-high-watermark-percent",
             "80",
@@ -515,7 +589,7 @@ mod tests {
 
     #[test]
     fn adaptive_low_watermark_remains_recoverable_when_high_is_minimum() {
-        let parsed = Config::try_from_iter([
+        let parsed = parse_config([
             "vantage",
             "--adaptive-high-watermark-percent",
             "1",
@@ -531,7 +605,7 @@ mod tests {
 
     #[test]
     fn global_config_seed_enables_filtering_by_default() {
-        let parsed = Config::try_from_iter(["vantage"]);
+        let parsed = parse_config(["vantage"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -543,7 +617,7 @@ mod tests {
 
     #[test]
     fn global_config_seed_respects_flow_key_mode() {
-        let parsed = Config::try_from_iter(["vantage", "--flow-keys-mode", "legacy"]);
+        let parsed = parse_config(["vantage", "--flow-keys-mode", "legacy"]);
         let Ok(config) = parsed else {
             panic!("config parsing should succeed");
         };
@@ -555,7 +629,7 @@ mod tests {
 
     #[test]
     fn essential_tenants_parse_mixed_formats() {
-        let parsed = Config::try_from_iter([
+        let parsed = parse_config([
             "vantage",
             "--essential-tenant",
             "cg:42",
@@ -574,7 +648,7 @@ mod tests {
     #[test]
     fn essential_tenants_can_be_parsed_from_env_csv() {
         temp_env::with_var("VANTAGE_ESSENTIAL_TENANTS", Some("cg:11,12"), || {
-            let parsed = Config::try_from_iter(["vantage"]);
+            let parsed = parse_config(["vantage"]);
             let Ok(config) = parsed else {
                 panic!("config parsing should succeed");
             };
