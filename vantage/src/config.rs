@@ -554,6 +554,34 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_values_can_be_overridden_by_env() {
+        temp_env::with_var("VANTAGE_RECONCILE_TICK_MS", Some("2500"), || {
+            temp_env::with_var("VANTAGE_RECONCILE_DEEP_CHECK_EVERY_N", Some("45"), || {
+                let parsed = parse_config(["vantage"]);
+                let Ok(config) = parsed else {
+                    panic!("config parsing should succeed");
+                };
+                assert_eq!(config.reconcile_tick_ms, 2_500);
+                assert_eq!(config.reconcile_deep_check_every_n, 45);
+            });
+        });
+    }
+
+    #[test]
+    fn reconcile_values_from_env_are_clamped_to_minimums() {
+        temp_env::with_var("VANTAGE_RECONCILE_TICK_MS", Some("0"), || {
+            temp_env::with_var("VANTAGE_RECONCILE_DEEP_CHECK_EVERY_N", Some("0"), || {
+                let parsed = parse_config(["vantage"]);
+                let Ok(config) = parsed else {
+                    panic!("config parsing should succeed");
+                };
+                assert_eq!(config.reconcile_tick_ms, 100);
+                assert_eq!(config.reconcile_deep_check_every_n, 1);
+            });
+        });
+    }
+
+    #[test]
     fn adaptive_high_watermark_is_clamped_to_hundred() {
         let parsed = parse_config(["vantage", "--adaptive-high-watermark-percent", "255"]);
         let Ok(config) = parsed else {
