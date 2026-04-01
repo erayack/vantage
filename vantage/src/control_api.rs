@@ -14,8 +14,8 @@ use crate::{
     adaptive::AdaptiveState,
     map_client::{MapError, PolicySource, ResolvedPolicy},
     metrics::{
-        CpuWindowSample, MetricsError, render_metrics_payload, sample_cpu_window_async,
-        sample_memory_percent_async,
+        CpuWindowSample, MetricsError, count_runtime_override_owners, render_metrics_payload,
+        sample_cpu_window_async, sample_memory_percent_async,
     },
     state_store::{RuntimeDeleteMode, RuntimeOwner, StateStoreError},
     tenancy::TenancyError,
@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+const DEBUG_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PutPolicyRequest {
@@ -245,6 +245,11 @@ impl SelectorView {
 pub(crate) struct BenchmarkSnapshot {
     pub version: u16,
     pub ts_unix_ms: u64,
+    pub state_store_version: u16,
+    pub desired_base_policy_count: u64,
+    pub desired_runtime_override_count: u64,
+    pub last_reconcile_unix_ms: u64,
+    pub last_reconcile_ok: bool,
     pub cpu: CpuWindowSample,
     pub system_memory_percent: f64,
     pub adaptive_state: AdaptiveState,
@@ -383,14 +388,14 @@ pub(crate) async fn put_policy(
             "accepted partial-l7 policy key with wildcard l4 selectors"
         );
     }
-    let maps = app.maps;
+    let maps = app.maps.clone();
     let policy = Policy {
         rate_tokens_per_sec: req.rate_tokens_per_sec,
         burst_tokens: req.burst_tokens,
         enabled: u8::from(req.enabled),
         _pad: [0; 7],
     };
-    let _ = app.state_store.upsert_base_policy(tenant, policy)?;
+    let _ = state_store_write(&app, app.state_store.upsert_base_policy(tenant, policy))?;
     if let Err(error) = maps.upsert_policy(tenant, policy) {
         warn!(
             tenant = ?tenant,
@@ -495,9 +500,11 @@ pub(crate) async fn put_runtime_policy(
         enabled: u8::from(req.enabled),
         _pad: [0; 7],
     };
-    let _ = app
-        .state_store
-        .upsert_manual_runtime_override(tenant, policy)?;
+    let _ = state_store_write(
+        &app,
+        app.state_store
+            .upsert_manual_runtime_override(tenant, policy),
+    )?;
     if let Err(error) = app.maps.upsert_runtime_policy(tenant, policy) {
         warn!(
             tenant = ?tenant,
@@ -568,7 +575,7 @@ pub(crate) async fn put_admin_enabled(
     State(app): State<AppState>,
     Json(req): Json<PutEnabledRequest>,
 ) -> Result<StatusCode, ApiError> {
-    app.state_store.set_global_enabled(req.enabled)?;
+    state_store_write(&app, app.state_store.set_global_enabled(req.enabled))?;
     if let Err(error) = app.maps.set_global_enabled(req.enabled) {
         warn!(
             error = %error,
@@ -607,9 +614,11 @@ pub(crate) async fn put_tenant_essential(
     Json(req): Json<PutEssentialRequest>,
 ) -> Result<Json<EssentialTenantResponse>, ApiError> {
     let cgroup_id = parse_tenant_cgroup_id(&tenant)?;
-    let _ = app
-        .state_store
-        .set_essential_tenant(cgroup_id, req.essential)?;
+    let _ = state_store_write(
+        &app,
+        app.state_store
+            .set_essential_tenant(cgroup_id, req.essential),
+    )?;
     if let Err(error) = app.tenancy.set_essential(cgroup_id, req.essential) {
         warn!(
             tenant = cgroup_id,
@@ -665,8 +674,8 @@ pub(crate) async fn delete_policy(
             query.http_path_hash,
         )?
         .to_tenant_key();
-    let maps = app.maps;
-    let deleted = app.state_store.delete_base_policy(tenant)?.is_some();
+    let maps = app.maps.clone();
+    let deleted = state_store_write(&app, app.state_store.delete_base_policy(tenant))?.is_some();
     if let Err(error) = maps.delete_policy(tenant) {
         warn!(
             tenant = ?tenant,
@@ -717,9 +726,11 @@ pub(crate) async fn delete_runtime_policy(
     } else {
         RuntimeDeleteMode::ManualOnly
     };
-    let deleted_record = app
-        .state_store
-        .delete_runtime_override_with_mode(tenant, delete_mode)?;
+    let deleted_record = state_store_write(
+        &app,
+        app.state_store
+            .delete_runtime_override_with_mode(tenant, delete_mode),
+    )?;
     if deleted_record.is_some()
         && let Err(error) = app.maps.delete_runtime_policy(tenant)
     {
@@ -780,6 +791,17 @@ pub(crate) async fn resolve_policy(
 ///
 /// Returns `ApiError` when metric encoding or map iteration fails.
 pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let snapshot = state.state_store.snapshot()?;
+    let (manual_count, adaptive_count) =
+        count_runtime_override_owners(snapshot.runtime_overrides.values());
+    state
+        .metrics
+        .runtime_overrides_manual
+        .set(i64::try_from(manual_count).unwrap_or(i64::MAX));
+    state
+        .metrics
+        .runtime_overrides_adaptive
+        .set(i64::try_from(adaptive_count).unwrap_or(i64::MAX));
     let payload = render_metrics_payload(
         &state.metrics,
         &state.maps,
@@ -820,7 +842,9 @@ pub(crate) async fn debug_snapshot(
     let sample_window = std::time::Duration::from_millis(app.config.cpu_window_ms);
     let cpu = sample_cpu_window_async(sample_window).await?;
     let system_memory_percent = sample_memory_percent_async().await?;
+    let desired = app.state_store.snapshot()?;
     let adaptive = app.adaptive_runtime.snapshot();
+    let reconcile = app.reconcile_runtime.snapshot();
     let global = app.maps.read_global_stats()?;
     let top_tenants = build_top_tenants(app.maps.collect_counters()?, app.config.debug_top_tenants);
     let ts_unix_ms = std::time::SystemTime::now()
@@ -832,6 +856,12 @@ pub(crate) async fn debug_snapshot(
     Ok(Json(BenchmarkSnapshot {
         version: DEBUG_SNAPSHOT_SCHEMA_VERSION,
         ts_unix_ms,
+        state_store_version: desired.version,
+        desired_base_policy_count: u64::try_from(desired.base_policies.len()).unwrap_or(u64::MAX),
+        desired_runtime_override_count: u64::try_from(desired.runtime_overrides.len())
+            .unwrap_or(u64::MAX),
+        last_reconcile_unix_ms: reconcile.last_reconcile_unix_ms,
+        last_reconcile_ok: reconcile.last_reconcile_ok,
         cpu,
         system_memory_percent,
         adaptive_state: adaptive.state,
@@ -841,6 +871,13 @@ pub(crate) async fn debug_snapshot(
         global: global.into(),
         top_tenants,
     }))
+}
+
+fn state_store_write<T>(app: &AppState, result: Result<T, StateStoreError>) -> Result<T, ApiError> {
+    result.map_err(|error| {
+        app.metrics.state_store_persist_failures_total.inc();
+        ApiError::StateStore(error)
+    })
 }
 
 fn parse_proto(proto: Option<&str>) -> Result<Option<FlowProto>, TenantParseError> {
@@ -939,7 +976,7 @@ mod tests {
         put_tenant_essential, resolve_policy, tenant_essential,
     };
     use crate::{
-        AppState, DropEventRuntime, MetricsState,
+        AppState, DropEventRuntime, MetricsState, ReconcileRuntimeState,
         adaptive::AdaptiveRuntimeState,
         config::{Config, PolicyValidationMode},
         map_client::{MapClient, MapError, MapOps},
@@ -1204,6 +1241,45 @@ mod tests {
         }
     }
 
+    fn register_metric<M>(registry: &Registry, metric: M, context: &str) -> M
+    where
+        M: prometheus::core::Collector + Clone + 'static,
+    {
+        assert!(
+            registry.register(Box::new(metric.clone())).is_ok(),
+            "{context} registration should succeed"
+        );
+        metric
+    }
+
+    fn test_config() -> Config {
+        Config {
+            iface: "lo".to_owned(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
+            state_file_path: PathBuf::from("./vantage-state.json"),
+            attach_ingress: true,
+            attach_egress: false,
+            drop_event_log_sample_n: 1,
+            drop_event_log_enabled: false,
+            cpu_window_ms: 5_000,
+            metrics_dimensions: crate::config::MetricsDimensions::Aggregate,
+            flow_keys_mode: crate::config::FlowKeysMode::Live,
+            debug_top_tenants: 10,
+            policy_validation_mode: PolicyValidationMode::Permissive,
+            adaptive: crate::config::AdaptiveConfig {
+                enabled: false,
+                high_watermark_percent: 90,
+                low_watermark_percent: 80,
+                tick_ms: 1_000,
+                throttle_rate_tokens_per_sec: 100,
+                throttle_burst_tokens: 500,
+            },
+            reconcile_tick_ms: 1_000,
+            reconcile_deep_check_every_n: 30,
+            essential_tenants: std::collections::BTreeSet::new(),
+        }
+    }
+
     fn test_state(maps: MapClient) -> AppState {
         let registry = Registry::new();
         let metric = IntGauge::new("vantage_daemon_up", "Daemon running state");
@@ -1211,48 +1287,65 @@ mod tests {
             panic!("metric should initialize");
         };
         daemon_up.set(1);
-        let register = registry.register(Box::new(daemon_up.clone()));
-        assert!(register.is_ok(), "metric registration should succeed");
-        let partial_metric = IntCounter::new(
-            "vantage_partial_l7_policy_keys_total",
-            "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
+        let daemon_up = register_metric(&registry, daemon_up, "daemon_up metric");
+        let partial_l7_policy_keys_total = register_metric(
+            &registry,
+            IntCounter::new(
+                "vantage_partial_l7_policy_keys_total",
+                "Total number of policy upserts with L7 selectors and wildcard L4 selectors",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "partial-l7 metric",
         );
-        let Ok(partial_l7_policy_keys_total) = partial_metric else {
-            panic!("metric should initialize");
-        };
-        let register_partial = registry.register(Box::new(partial_l7_policy_keys_total.clone()));
-        assert!(
-            register_partial.is_ok(),
-            "partial-l7 metric registration should succeed"
+        let reconcile_failures_total = register_metric(
+            &registry,
+            IntCounter::new(
+                "vantage_reconcile_failures_total",
+                "Total number of non-fatal reconcile tick failures",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "reconcile failure metric",
+        );
+        let state_store_persist_failures_total = register_metric(
+            &registry,
+            IntCounter::new(
+                "vantage_state_store_persist_failures_total",
+                "Total number of persisted desired-state mutation failures",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "persist failure metric",
+        );
+        let state_store_reconcile_failures_total = register_metric(
+            &registry,
+            IntCounter::new(
+                "vantage_state_store_reconcile_failures_total",
+                "Total number of non-fatal reconcile tick failures while converging persisted desired state",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "state-store reconcile failure metric",
+        );
+        let runtime_overrides_manual = register_metric(
+            &registry,
+            IntGauge::new(
+                "vantage_runtime_overrides_manual",
+                "Current number of manual runtime overrides in persisted desired state",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "manual runtime override gauge",
+        );
+        let runtime_overrides_adaptive = register_metric(
+            &registry,
+            IntGauge::new(
+                "vantage_runtime_overrides_adaptive",
+                "Current number of adaptive runtime overrides in persisted desired state",
+            )
+            .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+            "adaptive runtime override gauge",
         );
         let state_store = test_state_store("control_api_state");
 
         AppState {
-            config: Config {
-                iface: "lo".to_owned(),
-                bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 3000)),
-                state_file_path: PathBuf::from("./vantage-state.json"),
-                attach_ingress: true,
-                attach_egress: false,
-                drop_event_log_sample_n: 1,
-                drop_event_log_enabled: false,
-                cpu_window_ms: 5_000,
-                metrics_dimensions: crate::config::MetricsDimensions::Aggregate,
-                flow_keys_mode: crate::config::FlowKeysMode::Live,
-                debug_top_tenants: 10,
-                policy_validation_mode: PolicyValidationMode::Permissive,
-                adaptive: crate::config::AdaptiveConfig {
-                    enabled: false,
-                    high_watermark_percent: 90,
-                    low_watermark_percent: 80,
-                    tick_ms: 1_000,
-                    throttle_rate_tokens_per_sec: 100,
-                    throttle_burst_tokens: 500,
-                },
-                reconcile_tick_ms: 1_000,
-                reconcile_deep_check_every_n: 30,
-                essential_tenants: std::collections::BTreeSet::new(),
-            },
+            config: test_config(),
             drop_events: DropEventRuntime {
                 kernel_sample_every: KERNEL_DROP_EVENT_SAMPLE_EVERY,
                 log_sample_n: 1,
@@ -1263,15 +1356,16 @@ mod tests {
                 registry,
                 daemon_up,
                 partial_l7_policy_keys_total,
-                reconcile_failures_total: IntCounter::new(
-                    "vantage_reconcile_failures_total",
-                    "Total number of non-fatal reconcile tick failures",
-                )
-                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                reconcile_failures_total,
+                state_store_persist_failures_total,
+                state_store_reconcile_failures_total,
+                runtime_overrides_manual,
+                runtime_overrides_adaptive,
             },
             state_store,
             tenancy: TenancyState::default(),
             adaptive_runtime: AdaptiveRuntimeState::default(),
+            reconcile_runtime: ReconcileRuntimeState::default(),
         }
     }
 
@@ -1346,8 +1440,16 @@ mod tests {
     }
 
     fn assert_snapshot_basics(payload: &serde_json::Value) {
-        assert_eq!(payload["version"], serde_json::json!(3));
+        assert_eq!(payload["version"], serde_json::json!(4));
         assert!(payload["ts_unix_ms"].as_u64().is_some());
+        assert_eq!(payload["state_store_version"], serde_json::json!(1));
+        assert_eq!(payload["desired_base_policy_count"], serde_json::json!(0));
+        assert_eq!(
+            payload["desired_runtime_override_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(payload["last_reconcile_unix_ms"], serde_json::json!(0));
+        assert_eq!(payload["last_reconcile_ok"], serde_json::json!(false));
         assert!(payload["cpu"]["window_ms"].as_u64().is_some());
         assert!(payload["cpu"]["system_cpu_percent"].as_f64().is_some());
         assert!(payload["cpu"]["daemon_cpu_percent"].as_f64().is_some());
@@ -2823,6 +2925,40 @@ mod tests {
         let maps = metrics_fixture_maps();
         let mut state = test_state(maps);
         state.config.metrics_dimensions = crate::config::MetricsDimensions::Aggregate;
+        let store = state.state_store.clone();
+        store
+            .upsert_manual_runtime_override(
+                TenantKey {
+                    cgroup_id: 42,
+                    http_path_hash: 0,
+                    dst_port: 0,
+                    proto: 0,
+                    http_method: 0,
+                },
+                Policy {
+                    rate_tokens_per_sec: 100,
+                    burst_tokens: 50,
+                    enabled: 1,
+                    _pad: [0; 7],
+                },
+            )
+            .unwrap_or_else(|error| panic!("manual runtime override should persist: {error}"));
+        let adaptive = store.upsert_adaptive_runtime_override(
+            TenantKey {
+                cgroup_id: 77,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0,
+            },
+            Policy {
+                rate_tokens_per_sec: 10,
+                burst_tokens: 5,
+                enabled: 1,
+                _pad: [0; 7],
+            },
+        );
+        assert!(adaptive.is_ok(), "adaptive runtime override should persist");
         let app = Router::new()
             .route("/metrics", get(metrics))
             .with_state(state);
@@ -2850,6 +2986,8 @@ mod tests {
             panic!("metrics response should be utf-8");
         };
         assert!(text.contains("vantage_tenant_pass_packets 10"));
+        assert!(text.contains("vantage_runtime_overrides_manual 1"));
+        assert!(text.contains("vantage_runtime_overrides_adaptive 1"));
         assert!(!text.contains("flow=\""));
     }
 

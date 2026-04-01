@@ -11,6 +11,7 @@ use vantage_common::{Counters, TenantKey};
 use crate::{
     MetricsState,
     map_client::{MapClient, MapError},
+    state_store::{RuntimeOverrideRecord, RuntimeOwner},
     tenant::{
         cgroup_id_label, http_method_label, normalized_flow_key, path_hash_label, proto_label,
     },
@@ -77,6 +78,22 @@ pub(crate) fn render_metrics_payload(
     payload.extend_from_slice(counters.as_bytes());
 
     Ok(payload)
+}
+
+pub(crate) fn count_runtime_override_owners<'a>(
+    records: impl IntoIterator<Item = &'a RuntimeOverrideRecord>,
+) -> (u64, u64) {
+    let mut manual = 0_u64;
+    let mut adaptive = 0_u64;
+
+    for record in records {
+        match record.owner {
+            RuntimeOwner::Manual => manual = manual.saturating_add(1),
+            RuntimeOwner::Adaptive => adaptive = adaptive.saturating_add(1),
+        }
+    }
+
+    (manual, adaptive)
 }
 
 /// Samples CPU utilization over a fixed window using procfs cumulative jiffies.

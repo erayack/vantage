@@ -11,7 +11,7 @@ pub mod tenant;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -60,6 +60,10 @@ pub(crate) struct MetricsState {
     pub(crate) daemon_up: IntGauge,
     pub(crate) partial_l7_policy_keys_total: IntCounter,
     pub(crate) reconcile_failures_total: IntCounter,
+    pub(crate) state_store_persist_failures_total: IntCounter,
+    pub(crate) state_store_reconcile_failures_total: IntCounter,
+    pub(crate) runtime_overrides_manual: IntGauge,
+    pub(crate) runtime_overrides_adaptive: IntGauge,
 }
 
 #[derive(Clone)]
@@ -71,6 +75,7 @@ pub struct AppState {
     pub(crate) state_store: state_store::StateStore,
     pub(crate) tenancy: TenancyState,
     pub(crate) adaptive_runtime: AdaptiveRuntimeState,
+    pub(crate) reconcile_runtime: ReconcileRuntimeState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -78,6 +83,40 @@ pub(crate) struct DropEventRuntime {
     pub(crate) kernel_sample_every: u64,
     pub(crate) log_sample_n: u32,
     pub(crate) log_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct ReconcileRuntimeSnapshot {
+    pub(crate) last_reconcile_unix_ms: u64,
+    pub(crate) last_reconcile_ok: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ReconcileRuntimeState {
+    inner: Arc<RwLock<ReconcileRuntimeSnapshot>>,
+}
+
+impl ReconcileRuntimeState {
+    pub(crate) fn update(&self, ok: bool, unix_ms: u64) {
+        match self.inner.write() {
+            Ok(mut snapshot) => {
+                snapshot.last_reconcile_ok = ok;
+                snapshot.last_reconcile_unix_ms = unix_ms;
+            }
+            Err(mut error) => {
+                let snapshot = error.get_mut();
+                snapshot.last_reconcile_ok = ok;
+                snapshot.last_reconcile_unix_ms = unix_ms;
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ReconcileRuntimeSnapshot {
+        match self.inner.read() {
+            Ok(snapshot) => *snapshot,
+            Err(error) => *error.into_inner(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +184,7 @@ pub(crate) async fn run(config: Config) -> Result<(), AppError> {
     let state = build_app_state(&config, ebpf)?;
     let initial_reconciled_revision = reconcile_once(&state)
         .context("failed to complete startup reconcile before serving traffic")?;
+    state.reconcile_runtime.update(true, unix_timestamp_ms());
     if let Some(ring_buf) = drop_event_ring {
         spawn_drop_event_consumer(
             ring_buf,
@@ -251,6 +291,7 @@ fn build_app_state(config: &Config, ebpf: Ebpf) -> Result<AppState, AppError> {
         state_store,
         tenancy: TenancyState::new(snapshot.essential_tenants),
         adaptive_runtime: AdaptiveRuntimeState::default(),
+        reconcile_runtime: ReconcileRuntimeState::default(),
     })
 }
 
@@ -422,9 +463,12 @@ fn spawn_reconcile_controller(
                     match reconcile_once(&app) {
                         Ok(reconciled_revision) => {
                             last_reconciled_revision = reconciled_revision;
+                            app.reconcile_runtime.update(true, unix_timestamp_ms());
                         }
                         Err(error) => {
                             app.metrics.reconcile_failures_total.inc();
+                            app.metrics.state_store_reconcile_failures_total.inc();
+                            app.reconcile_runtime.update(false, unix_timestamp_ms());
                             warn!(
                                 error = %error,
                                 tick_index,
@@ -437,6 +481,14 @@ fn spawn_reconcile_controller(
             }
         }
     })
+}
+
+fn unix_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 const fn should_reconcile_tick(
@@ -521,12 +573,36 @@ fn build_metrics_state() -> anyhow::Result<MetricsState> {
         "Total number of non-fatal reconcile tick failures",
     )?;
     registry.register(Box::new(reconcile_failures_total.clone()))?;
+    let state_store_persist_failures_total = IntCounter::new(
+        "vantage_state_store_persist_failures_total",
+        "Total number of persisted desired-state mutation failures",
+    )?;
+    registry.register(Box::new(state_store_persist_failures_total.clone()))?;
+    let state_store_reconcile_failures_total = IntCounter::new(
+        "vantage_state_store_reconcile_failures_total",
+        "Total number of non-fatal reconcile tick failures while converging persisted desired state",
+    )?;
+    registry.register(Box::new(state_store_reconcile_failures_total.clone()))?;
+    let runtime_overrides_manual = IntGauge::new(
+        "vantage_runtime_overrides_manual",
+        "Current number of manual runtime overrides in persisted desired state",
+    )?;
+    registry.register(Box::new(runtime_overrides_manual.clone()))?;
+    let runtime_overrides_adaptive = IntGauge::new(
+        "vantage_runtime_overrides_adaptive",
+        "Current number of adaptive runtime overrides in persisted desired state",
+    )?;
+    registry.register(Box::new(runtime_overrides_adaptive.clone()))?;
 
     Ok(MetricsState {
         registry,
         daemon_up,
         partial_l7_policy_keys_total,
         reconcile_failures_total,
+        state_store_persist_failures_total,
+        state_store_reconcile_failures_total,
+        runtime_overrides_manual,
+        runtime_overrides_adaptive,
     })
 }
 
@@ -595,7 +671,9 @@ mod tests {
         TenantKey,
     };
 
-    use super::{AppState, DropEventRuntime, MetricsState, direction_name, healthz};
+    use super::{
+        AppState, DropEventRuntime, MetricsState, ReconcileRuntimeState, direction_name, healthz,
+    };
     use crate::{
         adaptive::AdaptiveRuntimeState,
         config::Config,
@@ -714,10 +792,31 @@ mod tests {
                     "Total number of non-fatal reconcile tick failures",
                 )
                 .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                state_store_persist_failures_total: IntCounter::new(
+                    "vantage_state_store_persist_failures_total",
+                    "Total number of persisted desired-state mutation failures",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                state_store_reconcile_failures_total: IntCounter::new(
+                    "vantage_state_store_reconcile_failures_total",
+                    "Total number of non-fatal reconcile tick failures while converging persisted desired state",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                runtime_overrides_manual: IntGauge::new(
+                    "vantage_runtime_overrides_manual",
+                    "Current number of manual runtime overrides in persisted desired state",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
+                runtime_overrides_adaptive: IntGauge::new(
+                    "vantage_runtime_overrides_adaptive",
+                    "Current number of adaptive runtime overrides in persisted desired state",
+                )
+                .unwrap_or_else(|error| panic!("metric should initialize: {error}")),
             },
             state_store,
             tenancy: TenancyState::default(),
             adaptive_runtime: AdaptiveRuntimeState::default(),
+            reconcile_runtime: ReconcileRuntimeState::default(),
         }
     }
 

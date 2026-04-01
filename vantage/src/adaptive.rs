@@ -172,7 +172,8 @@ fn reconcile_managed_overrides(
         }
         let removed = app
             .state_store
-            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive)?;
+            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive);
+        let removed = state_store_write(app, removed)?;
         if removed {
             app.maps.delete_runtime_policy(key)?;
         }
@@ -198,7 +199,8 @@ fn reconcile_managed_overrides(
         }
         let outcome = app
             .state_store
-            .upsert_adaptive_runtime_override(key, policy)?;
+            .upsert_adaptive_runtime_override(key, policy);
+        let outcome = state_store_write(app, outcome)?;
         match outcome {
             AdaptiveUpsertOutcome::Applied => {
                 app.maps.upsert_runtime_policy(key, policy)?;
@@ -221,13 +223,24 @@ fn clear_managed_overrides(
     for key in to_remove {
         let removed = app
             .state_store
-            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive)?;
+            .delete_runtime_override_if_owner(key, RuntimeOwner::Adaptive);
+        let removed = state_store_write(app, removed)?;
         if removed {
             app.maps.delete_runtime_policy(key)?;
         }
         let _ = managed_overrides.remove(&key);
     }
     Ok(())
+}
+
+fn state_store_write<T>(
+    app: &AppState,
+    result: Result<T, StateStoreError>,
+) -> Result<T, AdaptiveError> {
+    result.map_err(|error| {
+        app.metrics.state_store_persist_failures_total.inc();
+        AdaptiveError::StateStore(error)
+    })
 }
 
 fn refresh_managed_overrides_from_snapshot(
