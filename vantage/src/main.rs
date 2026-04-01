@@ -45,8 +45,8 @@ use crate::{
     config::Config,
     control_api::{
         debug_cpu_window, debug_snapshot, delete_policy, delete_runtime_policy, get_admin_enabled,
-        metrics, put_admin_enabled, put_policy, put_runtime_policy, put_tenant_essential,
-        resolve_policy, tenant_essential,
+        get_policy_list, get_runtime_policy_list, metrics, put_admin_enabled, put_policy,
+        put_runtime_policy, put_tenant_essential, resolve_policy, tenant_essential,
     },
     events::{RingBufferHandle, spawn_drop_event_consumer, take_drop_event_ring},
     map_client::{MapClient, MapError},
@@ -261,7 +261,9 @@ fn build_app_state(
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/policy", get(get_policy_list))
         .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+        .route("/runtime-policy", get(get_runtime_policy_list))
         .route(
             "/runtime-policy/:tenant",
             put(put_runtime_policy).delete(delete_runtime_policy),

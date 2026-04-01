@@ -189,6 +189,35 @@ pub(crate) struct ResolvePolicyResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct PolicyListResponse {
+    pub items: Vec<PolicyListEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PolicyListEntry {
+    pub tenant: TenantKey,
+    pub selector: SelectorView,
+    pub flow: String,
+    pub scope: PolicyMatchLevel,
+    pub policy: PolicyView,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimePolicyListResponse {
+    pub items: Vec<RuntimePolicyListEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimePolicyListEntry {
+    pub tenant: TenantKey,
+    pub selector: SelectorView,
+    pub flow: String,
+    pub scope: PolicyMatchLevel,
+    pub owner: RuntimeOwner,
+    pub policy: PolicyView,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct SelectorView {
     pub proto: &'static str,
     pub dst_port: Option<u16>,
@@ -286,6 +315,8 @@ pub(crate) enum ApiError {
     Tenancy(#[from] TenancyError),
     #[error(transparent)]
     StateStore(#[from] StateStoreError),
+    #[error("{message}")]
+    DeferredApply { message: String },
 }
 
 impl IntoResponse for ApiError {
@@ -312,6 +343,7 @@ impl IntoResponse for ApiError {
                 format!("state store operation failed: {error}"),
             )
                 .into_response(),
+            Self::DeferredApply { message } => (StatusCode::ACCEPTED, message).into_response(),
         }
     }
 }
@@ -358,24 +390,19 @@ pub(crate) async fn put_policy(
         enabled: u8::from(req.enabled),
         _pad: [0; 7],
     };
-    let previous = app.state_store.upsert_base_policy(tenant, policy)?;
+    let _ = app.state_store.upsert_base_policy(tenant, policy)?;
     if let Err(error) = maps.upsert_policy(tenant, policy) {
-        let rollback = if let Some(previous_policy) = previous {
-            app.state_store
-                .upsert_base_policy(tenant, previous_policy)
-                .map(|_| ())
-        } else {
-            app.state_store.delete_base_policy(tenant).map(|_| ())
-        };
-        if let Err(rollback_error) = rollback {
-            warn!(
-                tenant = ?tenant,
-                error = %rollback_error,
-                "failed to rollback persisted base policy after map apply failure"
-            );
-            return Err(ApiError::StateStore(rollback_error));
-        }
-        return Err(ApiError::Map(error));
+        warn!(
+            tenant = ?tenant,
+            error = %error,
+            "base policy map apply failed after persisted update; reconcile will retry"
+        );
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted base policy for tenant '{}' but immediate POLICY_MAP apply failed: {error}; reconcile will retry",
+                normalized_flow_key(tenant)
+            ),
+        });
     }
     let effective_for_stored = maps.resolve_policy(tenant)?.map_or_else(
         || ResolvedPolicyView {
@@ -401,6 +428,30 @@ pub(crate) async fn put_policy(
         effective_for_stored,
         warnings,
     }))
+}
+
+/// Lists persisted base policies from the desired-state store.
+///
+/// # Errors
+///
+/// Returns `ApiError` when state-store snapshot reads fail.
+pub(crate) async fn get_policy_list(
+    State(app): State<AppState>,
+) -> Result<Json<PolicyListResponse>, ApiError> {
+    let snapshot = app.state_store.snapshot()?;
+    let items = snapshot
+        .base_policies
+        .into_iter()
+        .map(|(tenant, policy)| PolicyListEntry {
+            tenant,
+            selector: SelectorView::from_tenant(tenant),
+            flow: normalized_flow_key(tenant),
+            scope: policy_scope_from_key(tenant),
+            policy: policy.into(),
+        })
+        .collect();
+
+    Ok(Json(PolicyListResponse { items }))
 }
 
 /// Upserts a manual runtime override policy into `RUNTIME_POLICY_MAP`.
@@ -483,6 +534,31 @@ pub(crate) async fn put_runtime_policy(
     }))
 }
 
+/// Lists persisted runtime overrides from the desired-state store.
+///
+/// # Errors
+///
+/// Returns `ApiError` when state-store snapshot reads fail.
+pub(crate) async fn get_runtime_policy_list(
+    State(app): State<AppState>,
+) -> Result<Json<RuntimePolicyListResponse>, ApiError> {
+    let snapshot = app.state_store.snapshot()?;
+    let items = snapshot
+        .runtime_overrides
+        .into_iter()
+        .map(|(tenant, record)| RuntimePolicyListEntry {
+            tenant,
+            selector: SelectorView::from_tenant(tenant),
+            flow: normalized_flow_key(tenant),
+            scope: policy_scope_from_key(tenant),
+            owner: record.owner,
+            policy: record.policy.into(),
+        })
+        .collect();
+
+    Ok(Json(RuntimePolicyListResponse { items }))
+}
+
 /// Sets global data-path enabled state in `GLOBAL_CONFIG_MAP[0]`.
 ///
 /// # Errors
@@ -492,17 +568,18 @@ pub(crate) async fn put_admin_enabled(
     State(app): State<AppState>,
     Json(req): Json<PutEnabledRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let previous = app.state_store.snapshot()?.global_enabled;
     app.state_store.set_global_enabled(req.enabled)?;
     if let Err(error) = app.maps.set_global_enabled(req.enabled) {
-        if let Err(rollback_error) = app.state_store.set_global_enabled(previous) {
-            warn!(
-                error = %rollback_error,
-                "failed to rollback persisted global enabled after map apply failure"
-            );
-            return Err(ApiError::StateStore(rollback_error));
-        }
-        return Err(ApiError::Map(error));
+        warn!(
+            error = %error,
+            "global enabled map apply failed after persisted update; reconcile will retry"
+        );
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted global enabled={} but immediate GLOBAL_CONFIG_MAP apply failed: {error}; reconcile will retry",
+                req.enabled
+            ),
+        });
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -530,24 +607,20 @@ pub(crate) async fn put_tenant_essential(
     Json(req): Json<PutEssentialRequest>,
 ) -> Result<Json<EssentialTenantResponse>, ApiError> {
     let cgroup_id = parse_tenant_cgroup_id(&tenant)?;
-    let previous = app
-        .state_store
-        .snapshot()?
-        .essential_tenants
-        .contains(&cgroup_id);
     let _ = app
         .state_store
         .set_essential_tenant(cgroup_id, req.essential)?;
     if let Err(error) = app.tenancy.set_essential(cgroup_id, req.essential) {
-        if let Err(rollback_error) = app.state_store.set_essential_tenant(cgroup_id, previous) {
-            warn!(
-                tenant = cgroup_id,
-                error = %rollback_error,
-                "failed to rollback persisted essential flag after tenancy apply failure"
-            );
-            return Err(ApiError::StateStore(rollback_error));
-        }
-        return Err(ApiError::Tenancy(error));
+        warn!(
+            tenant = cgroup_id,
+            error = %error,
+            "essential tenant apply failed after persisted update; startup restore will retry"
+        );
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted essential tenant state for cgroup '{cgroup_id}' but immediate tenancy apply failed: {error}; startup restore will retry"
+            ),
+        });
     }
 
     Ok(Json(EssentialTenantResponse {
@@ -593,20 +666,19 @@ pub(crate) async fn delete_policy(
         )?
         .to_tenant_key();
     let maps = app.maps;
-    let deleted = maps.get_policy(tenant)?.is_some();
-    let previous = app.state_store.delete_base_policy(tenant)?;
+    let deleted = app.state_store.delete_base_policy(tenant)?.is_some();
     if let Err(error) = maps.delete_policy(tenant) {
-        if let Some(previous_policy) = previous
-            && let Err(rollback_error) = app.state_store.upsert_base_policy(tenant, previous_policy)
-        {
-            warn!(
-                tenant = ?tenant,
-                error = %rollback_error,
-                "failed to rollback persisted base policy after map delete failure"
-            );
-            return Err(ApiError::StateStore(rollback_error));
-        }
-        return Err(ApiError::Map(error));
+        warn!(
+            tenant = ?tenant,
+            error = %error,
+            "base policy map delete failed after persisted update; reconcile will retry"
+        );
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted base policy delete for tenant '{}' but immediate POLICY_MAP delete failed: {error}; reconcile will retry",
+                normalized_flow_key(tenant)
+            ),
+        });
     }
     let effective_after_delete = maps.resolve_policy(tenant)?;
 
@@ -862,8 +934,9 @@ mod tests {
 
     use super::{
         PARTIAL_L7_POLICY_WARNING, build_top_tenants, debug_cpu_window, debug_snapshot,
-        delete_policy, delete_runtime_policy, get_admin_enabled, metrics, put_admin_enabled,
-        put_policy, put_runtime_policy, put_tenant_essential, resolve_policy, tenant_essential,
+        delete_policy, delete_runtime_policy, get_admin_enabled, get_policy_list,
+        get_runtime_policy_list, metrics, put_admin_enabled, put_policy, put_runtime_policy,
+        put_tenant_essential, resolve_policy, tenant_essential,
     };
     use crate::{
         AppState, DropEventRuntime, MetricsState,
@@ -1039,6 +1112,95 @@ mod tests {
                 .lock()
                 .map_err(|_| MapError::LockPoisoned)?;
             Ok(*current)
+        }
+    }
+
+    struct FailingMapOps {
+        inner: InMemoryMapOps,
+        fail_upsert_policy: bool,
+        fail_delete_policy: bool,
+        fail_set_global_enabled: bool,
+    }
+
+    impl FailingMapOps {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryMapOps::new(),
+                fail_upsert_policy: false,
+                fail_delete_policy: false,
+                fail_set_global_enabled: false,
+            }
+        }
+    }
+
+    impl MapOps for FailingMapOps {
+        fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            if self.fail_upsert_policy {
+                return Err(MapError::MissingMap("POLICY_MAP"));
+            }
+            self.inner.upsert_policy(tenant, policy)
+        }
+
+        fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+            if self.fail_delete_policy {
+                return Err(MapError::MissingMap("POLICY_MAP"));
+            }
+            self.inner.delete_policy(tenant)
+        }
+
+        fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            self.inner.get_policy(tenant)
+        }
+
+        fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            self.inner.upsert_runtime_policy(tenant, policy)
+        }
+
+        fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+            self.inner.delete_runtime_policy(tenant)
+        }
+
+        fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            self.inner.get_runtime_policy(tenant)
+        }
+
+        fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            self.inner.collect_policy_keys()
+        }
+
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            self.inner.collect_runtime_policy_keys()
+        }
+
+        fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
+            self.inner.collect_counters()
+        }
+
+        fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
+            self.inner.read_global_stats()
+        }
+
+        fn seed_global_config(&self, config: GlobalConfig) -> Result<(), MapError> {
+            self.inner.seed_global_config(config)
+        }
+
+        fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
+            if self.fail_set_global_enabled {
+                return Err(MapError::MissingMap("GLOBAL_CONFIG_MAP"));
+            }
+            self.inner.set_global_enabled(enabled)
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            self.inner.get_global_enabled()
+        }
+
+        fn set_flow_keys_live(&self, flow_keys_live: bool) -> Result<(), MapError> {
+            self.inner.set_flow_keys_live(flow_keys_live)
+        }
+
+        fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+            self.inner.get_flow_keys_live()
         }
     }
 
@@ -1298,6 +1460,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_policy_returns_accepted_when_immediate_map_apply_fails_but_persists() {
+        let maps = MapClient::from_ops(Arc::new(FailingMapOps {
+            fail_upsert_policy: true,
+            ..FailingMapOps::new()
+        }));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/policy/42")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ));
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+        let resp = app
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|error| panic!("response body should be readable: {error}"));
+        let body = String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|error| panic!("response body should be utf-8: {error}"));
+        assert!(
+            body.contains("persisted base policy"),
+            "accepted response should describe deferred map apply"
+        );
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+        assert!(
+            snapshot.base_policies.contains_key(&TenantKey {
+                cgroup_id: 42,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0
+            }),
+            "base policy should be persisted despite immediate apply failure"
+        );
+    }
+
+    #[tokio::test]
     async fn put_runtime_policy_stores_manual_owner() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let state = test_state(maps.clone());
@@ -1341,6 +1555,125 @@ mod tests {
             panic!("runtime override should be persisted");
         };
         assert_eq!(stored.owner, RuntimeOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn get_policy_list_returns_persisted_base_policies() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 443,
+            proto: 6,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 100,
+            burst_tokens: 50,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let persisted = store.upsert_base_policy(tenant, policy);
+        assert!(persisted.is_ok(), "base policy should persist");
+
+        let app = Router::new()
+            .route("/policy", get(get_policy_list))
+            .with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/policy")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(payload["items"].as_array().map_or(0, Vec::len), 1);
+        assert_eq!(
+            payload["items"][0]["tenant"]["cgroup_id"],
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            payload["items"][0]["scope"],
+            serde_json::json!("method_path_wildcard")
+        );
+        assert_eq!(
+            payload["items"][0]["flow"],
+            serde_json::json!("cgroup=42|proto=tcp|dport=443|method=*|path_hash=*")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_runtime_policy_list_returns_persisted_owners() {
+        let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 100,
+            burst_tokens: 50,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let persisted = store.upsert_manual_runtime_override(tenant, policy);
+        assert!(persisted.is_ok(), "runtime policy should persist");
+
+        let app = Router::new()
+            .route("/runtime-policy", get(get_runtime_policy_list))
+            .with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/runtime-policy")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+
+        let resp = match app.oneshot(request).await {
+            Ok(resp) => resp,
+            Err(error) => match error {},
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let read = to_bytes(resp.into_body(), usize::MAX).await;
+        let Ok(bytes) = read else {
+            panic!("response body should be readable");
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let Ok(payload) = parsed else {
+            panic!("response should be valid JSON");
+        };
+        assert_eq!(payload["items"].as_array().map_or(0, Vec::len), 1);
+        assert_eq!(
+            payload["items"][0]["tenant"]["cgroup_id"],
+            serde_json::json!(42)
+        );
+        assert_eq!(payload["items"][0]["owner"], serde_json::json!("manual"));
+        assert_eq!(
+            payload["items"][0]["scope"],
+            serde_json::json!("full_wildcard")
+        );
     }
 
     #[tokio::test]
@@ -2032,6 +2365,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_policy_returns_accepted_when_immediate_map_delete_fails_but_persists() {
+        let maps = MapClient::from_ops(Arc::new(FailingMapOps {
+            fail_delete_policy: true,
+            ..FailingMapOps::new()
+        }));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 100,
+            burst_tokens: 50,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        store
+            .upsert_base_policy(tenant, policy)
+            .unwrap_or_else(|error| panic!("seed policy should persist: {error}"));
+
+        let app = Router::new()
+            .route("/policy/:tenant", put(put_policy).delete(delete_policy))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/policy/42")
+            .body(Body::empty());
+        let Ok(request) = req else {
+            panic!("request should build");
+        };
+        let resp = app
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+        assert!(
+            !snapshot.base_policies.contains_key(&tenant),
+            "persisted policy should be deleted despite immediate map delete failure"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_policy_is_idempotent() {
         let maps = MapClient::from_ops(Arc::new(InMemoryMapOps::new()));
         let app = Router::new()
@@ -2254,6 +2638,42 @@ mod tests {
             panic!("response should be valid JSON");
         };
         assert_eq!(payload, serde_json::json!({"enabled": false}));
+    }
+
+    #[tokio::test]
+    async fn put_admin_enabled_returns_accepted_when_immediate_map_apply_fails_but_persists() {
+        let maps = MapClient::from_ops(Arc::new(FailingMapOps {
+            fail_set_global_enabled: true,
+            ..FailingMapOps::new()
+        }));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let app = Router::new()
+            .route(
+                "/admin/enabled",
+                put(put_admin_enabled).get(get_admin_enabled),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/admin/enabled")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"enabled":false}"#))
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let response = app
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+        assert!(
+            !snapshot.global_enabled,
+            "global enabled should persist despite immediate apply failure"
+        );
     }
 
     #[tokio::test]
@@ -2539,5 +2959,38 @@ mod tests {
             .unwrap_or_else(|error| panic!("response should be valid json: {error}"));
         assert_eq!(payload["tenant"], serde_json::json!(99));
         assert_eq!(payload["essential"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn tenancy_endpoint_returns_accepted_when_immediate_apply_fails_but_persists() {
+        let state = test_state(MapClient::from_ops(Arc::new(InMemoryMapOps::new())));
+        state.tenancy.poison_for_tests();
+        let store = state.state_store.clone();
+        let app = Router::new()
+            .route(
+                "/tenancy/:tenant/essential",
+                put(put_tenant_essential).get(tenant_essential),
+            )
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/tenancy/99/essential")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"essential":true}"#))
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let response = app
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+        assert!(
+            snapshot.essential_tenants.contains(&99),
+            "essential tenant should persist despite immediate apply failure"
+        );
     }
 }

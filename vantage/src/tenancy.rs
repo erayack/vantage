@@ -46,6 +46,17 @@ impl TenancyState {
 
         Ok(essential.remove(&cgroup_id))
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_tests(&self) {
+        let essential = Arc::clone(&self.essential);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = essential
+                .write()
+                .unwrap_or_else(|error| panic!("fixture lock should be writable: {error}"));
+            panic!("poison tenancy lock");
+        }));
+    }
 }
 
 #[cfg(test)]

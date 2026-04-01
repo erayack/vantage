@@ -289,12 +289,14 @@ mod tests {
 
     #[test]
     fn default_direction_is_ingress_only() {
-        let parsed = Config::try_from_iter(["vantage"]);
-        let Ok(config) = parsed else {
-            panic!("config parsing should succeed");
-        };
-        assert!(config.attach_ingress);
-        assert!(!config.attach_egress);
+        temp_env::with_var("VANTAGE_ATTACH_DIRECTION", None::<&str>, || {
+            let parsed = Config::try_from_iter(["vantage"]);
+            let Ok(config) = parsed else {
+                panic!("config parsing should succeed");
+            };
+            assert!(config.attach_ingress);
+            assert!(!config.attach_egress);
+        });
     }
 
     #[test]
