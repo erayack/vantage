@@ -463,7 +463,7 @@ pub(crate) async fn get_policy_list(
 ///
 /// # Errors
 ///
-/// Returns `ApiError` when map lookup/update fails.
+/// Returns `ApiError` when persistence, selector parsing, or live-map resolution fails.
 pub(crate) async fn put_runtime_policy(
     Path(tenant): Path<String>,
     State(app): State<AppState>,
@@ -511,7 +511,12 @@ pub(crate) async fn put_runtime_policy(
             error = %error,
             "runtime override map apply failed after persisted update; reconcile will retry"
         );
-        return Err(ApiError::Map(error));
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted runtime override for tenant '{}' but immediate RUNTIME_POLICY_MAP apply failed: {error}; reconcile will retry",
+                normalized_flow_key(tenant)
+            ),
+        });
     }
 
     let effective_for_stored = app.maps.resolve_policy(tenant)?.map_or_else(
@@ -705,7 +710,7 @@ pub(crate) async fn delete_policy(
 ///
 /// # Errors
 ///
-/// Returns `ApiError` when map lookup/delete fails.
+/// Returns `ApiError` when persistence, selector parsing, or live-map resolution fails.
 pub(crate) async fn delete_runtime_policy(
     Path(tenant): Path<String>,
     Query(query): Query<DeleteRuntimePolicyQuery>,
@@ -739,7 +744,12 @@ pub(crate) async fn delete_runtime_policy(
             error = %error,
             "runtime override map delete failed after persisted update; reconcile will retry"
         );
-        return Err(ApiError::Map(error));
+        return Err(ApiError::DeferredApply {
+            message: format!(
+                "persisted runtime override delete for tenant '{}' but immediate RUNTIME_POLICY_MAP delete failed: {error}; reconcile will retry",
+                normalized_flow_key(tenant)
+            ),
+        });
     }
     let effective_after_delete = app.maps.resolve_policy(tenant)?;
 
@@ -1152,34 +1162,56 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum FailingMapOp {
+        PolicyUpsert,
+        PolicyDelete,
+        RuntimePolicyUpsert,
+        RuntimePolicyDelete,
+        SetGlobalEnabled,
+    }
+
+    #[derive(Default)]
+    struct FailingMapOpsConfig {
+        fail_ops: std::collections::BTreeSet<FailingMapOp>,
+    }
+
+    impl FailingMapOpsConfig {
+        fn with_failure(op: FailingMapOp) -> Self {
+            let mut fail_ops = std::collections::BTreeSet::new();
+            let _ = fail_ops.insert(op);
+            Self { fail_ops }
+        }
+
+        fn should_fail(&self, op: FailingMapOp) -> bool {
+            self.fail_ops.contains(&op)
+        }
+    }
+
     struct FailingMapOps {
         inner: InMemoryMapOps,
-        fail_upsert_policy: bool,
-        fail_delete_policy: bool,
-        fail_set_global_enabled: bool,
+        failures: FailingMapOpsConfig,
     }
 
     impl FailingMapOps {
         fn new() -> Self {
             Self {
                 inner: InMemoryMapOps::new(),
-                fail_upsert_policy: false,
-                fail_delete_policy: false,
-                fail_set_global_enabled: false,
+                failures: FailingMapOpsConfig::default(),
             }
         }
     }
 
     impl MapOps for FailingMapOps {
         fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
-            if self.fail_upsert_policy {
+            if self.failures.should_fail(FailingMapOp::PolicyUpsert) {
                 return Err(MapError::MissingMap("POLICY_MAP"));
             }
             self.inner.upsert_policy(tenant, policy)
         }
 
         fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
-            if self.fail_delete_policy {
+            if self.failures.should_fail(FailingMapOp::PolicyDelete) {
                 return Err(MapError::MissingMap("POLICY_MAP"));
             }
             self.inner.delete_policy(tenant)
@@ -1190,10 +1222,16 @@ mod tests {
         }
 
         fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            if self.failures.should_fail(FailingMapOp::RuntimePolicyUpsert) {
+                return Err(MapError::MissingMap("RUNTIME_POLICY_MAP"));
+            }
             self.inner.upsert_runtime_policy(tenant, policy)
         }
 
         fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
+            if self.failures.should_fail(FailingMapOp::RuntimePolicyDelete) {
+                return Err(MapError::MissingMap("RUNTIME_POLICY_MAP"));
+            }
             self.inner.delete_runtime_policy(tenant)
         }
 
@@ -1222,7 +1260,7 @@ mod tests {
         }
 
         fn set_global_enabled(&self, enabled: bool) -> Result<(), MapError> {
-            if self.fail_set_global_enabled {
+            if self.failures.should_fail(FailingMapOp::SetGlobalEnabled) {
                 return Err(MapError::MissingMap("GLOBAL_CONFIG_MAP"));
             }
             self.inner.set_global_enabled(enabled)
@@ -1565,7 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn put_policy_returns_accepted_when_immediate_map_apply_fails_but_persists() {
         let maps = MapClient::from_ops(Arc::new(FailingMapOps {
-            fail_upsert_policy: true,
+            failures: FailingMapOpsConfig::with_failure(FailingMapOp::PolicyUpsert),
             ..FailingMapOps::new()
         }));
         let state = test_state(maps);
@@ -1647,6 +1685,52 @@ mod tests {
         let Ok(snapshot) = snapshot else {
             panic!("snapshot should succeed");
         };
+        let stored = snapshot.runtime_overrides.get(&TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        });
+        let Some(stored) = stored else {
+            panic!("runtime override should be persisted");
+        };
+        assert_eq!(stored.owner, RuntimeOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn put_runtime_policy_returns_accepted_when_immediate_map_apply_fails_but_persists() {
+        let maps = MapClient::from_ops(Arc::new(FailingMapOps {
+            failures: FailingMapOpsConfig::with_failure(FailingMapOp::RuntimePolicyUpsert),
+            ..FailingMapOps::new()
+        }));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let app = Router::new()
+            .route(
+                "/runtime-policy/:tenant",
+                put(put_runtime_policy).delete(delete_runtime_policy),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/runtime-policy/42")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rate_tokens_per_sec":100,"burst_tokens":50,"enabled":true}"#,
+            ))
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+
+        let resp = app
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
         let stored = snapshot.runtime_overrides.get(&TenantKey {
             cgroup_id: 42,
             http_path_hash: 0,
@@ -1926,6 +2010,58 @@ mod tests {
             panic!("runtime map read should succeed");
         };
         assert_eq!(runtime_map, None);
+    }
+
+    #[tokio::test]
+    async fn delete_runtime_policy_returns_accepted_when_immediate_map_delete_fails_but_persists() {
+        let maps = MapClient::from_ops(Arc::new(FailingMapOps {
+            failures: FailingMapOpsConfig::with_failure(FailingMapOp::RuntimePolicyDelete),
+            ..FailingMapOps::new()
+        }));
+        let state = test_state(maps);
+        let store = state.state_store.clone();
+        let tenant = TenantKey {
+            cgroup_id: 42,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 100,
+            burst_tokens: 50,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        store
+            .upsert_manual_runtime_override(tenant, policy)
+            .unwrap_or_else(|error| panic!("runtime override should persist: {error}"));
+
+        let app = Router::new()
+            .route(
+                "/runtime-policy/:tenant",
+                put(put_runtime_policy).delete(delete_runtime_policy),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/runtime-policy/42")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request should build: {error}"));
+        let resp = app
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|error| match error {});
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let snapshot = store
+            .snapshot()
+            .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+        assert!(
+            !snapshot.runtime_overrides.contains_key(&tenant),
+            "persisted runtime override should be deleted despite immediate map delete failure"
+        );
     }
 
     #[tokio::test]
@@ -2470,7 +2606,7 @@ mod tests {
     #[tokio::test]
     async fn delete_policy_returns_accepted_when_immediate_map_delete_fails_but_persists() {
         let maps = MapClient::from_ops(Arc::new(FailingMapOps {
-            fail_delete_policy: true,
+            failures: FailingMapOpsConfig::with_failure(FailingMapOp::PolicyDelete),
             ..FailingMapOps::new()
         }));
         let state = test_state(maps);
@@ -2746,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn put_admin_enabled_returns_accepted_when_immediate_map_apply_fails_but_persists() {
         let maps = MapClient::from_ops(Arc::new(FailingMapOps {
-            fail_set_global_enabled: true,
+            failures: FailingMapOpsConfig::with_failure(FailingMapOp::SetGlobalEnabled),
             ..FailingMapOps::new()
         }));
         let state = test_state(maps);

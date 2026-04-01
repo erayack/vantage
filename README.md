@@ -34,6 +34,7 @@ The eBPF object is compiled and embedded automatically by the build script.
 | `--iface` | `VANTAGE_IFACE` | `lo` | Network interface to attach to |
 | `--direction` | `VANTAGE_ATTACH_DIRECTION` | `ingress` | `ingress`, `egress`, or `both` |
 | `--bind-addr` | `VANTAGE_BIND_ADDR` | `127.0.0.1:3000` | HTTP API listen address |
+| `--state-file-path` | `VANTAGE_STATE_FILE_PATH` | `./vantage-state.json` | JSON file used to persist desired control-plane state across restarts |
 | `--drop-event-sample-n` | `VANTAGE_DROP_EVENT_SAMPLE_N` | `1` | Sample 1-in-N drop events to ring buffer |
 | `--drop-event-log-enabled` | `VANTAGE_DROP_EVENT_LOG_ENABLED` | `false` | Enable drop event consumer |
 | `--cpu-window-ms` | `VANTAGE_CPU_WINDOW_MS` | `5000` | CPU sampling window for `/debug/snapshot` |
@@ -47,14 +48,22 @@ The eBPF object is compiled and embedded automatically by the build script.
 | `--adaptive-tick-ms` | `VANTAGE_ADAPTIVE_TICK_MS` | `1000` | Adaptive controller tick and sampling window in milliseconds |
 | `--adaptive-throttle-rate-tokens-per-sec` | `VANTAGE_ADAPTIVE_THROTTLE_RATE_TOKENS_PER_SEC` | `100` | Runtime override token refill rate applied while throttling |
 | `--adaptive-throttle-burst-tokens` | `VANTAGE_ADAPTIVE_THROTTLE_BURST_TOKENS` | `500` | Runtime override burst size applied while throttling |
+| `--reconcile-tick-ms` | `VANTAGE_RECONCILE_TICK_MS` | `2000` | Periodic desired-state reconcile tick; repairs drift between persisted state and kernel maps |
+| `--reconcile-deep-check-every-n` | `VANTAGE_RECONCILE_DEEP_CHECK_EVERY_N` | `30` | Force a full reconcile every N ticks even when the desired-state revision is unchanged |
 | `--essential-tenant` | `VANTAGE_ESSENTIAL_TENANTS` | _(empty)_ | Tenant exempt from adaptive throttling (`cg:<id>` or `<id>`; env accepts CSV) |
 
 ## API
 
 ```
+GET    /policy                   # list persisted base policies
 PUT    /policy/{tenant}          # upsert rate-limit policy and return precedence metadata
 DELETE /policy/{tenant}          # remove policy and return effective fallback after delete
+GET    /runtime-policy           # list persisted runtime overrides with ownership metadata
+PUT    /runtime-policy/{tenant}  # upsert manual runtime override
+DELETE /runtime-policy/{tenant}  # delete runtime override (manual only unless force=true)
 GET    /policy/{tenant}/resolve  # resolve effective policy using precedence chain
+GET    /admin/enabled            # read live global datapath enabled flag
+PUT    /admin/enabled            # persist and apply live global datapath enabled flag
 GET    /tenancy/{tenant}/essential # read tenant essential/non-essential state
 PUT    /tenancy/{tenant}/essential # set tenant essential/non-essential state
 GET    /metrics                  # Prometheus counters (aggregate by default; per-flow when enabled)
@@ -93,6 +102,12 @@ FNV-1a hashing or the request is rejected.
 Policy precedence is explicit and enforced consistently across API and kernel data-path:
 
 `runtime_override:[exact(cgroup_id, proto, dst_port, http_method, http_path_hash) > path_wildcard(cgroup_id, proto, dst_port, http_method, 0) > method_path_wildcard(cgroup_id, proto, dst_port, 0, 0) > port_method_path_wildcard(cgroup_id, proto, 0, 0, 0) > full_wildcard(cgroup_id, 0, 0, 0, 0)] > base:[exact(cgroup_id, proto, dst_port, http_method, http_path_hash) > path_wildcard(cgroup_id, proto, dst_port, http_method, 0) > method_path_wildcard(cgroup_id, proto, dst_port, 0, 0) > port_method_path_wildcard(cgroup_id, proto, 0, 0, 0) > full_wildcard(cgroup_id, 0, 0, 0, 0)]`
+
+## Durable Control Plane
+
+Mutating control-plane endpoints persist desired state first, then attempt an immediate best-effort apply to live kernel maps or in-memory tenancy state. If persistence succeeds but the immediate apply fails, the endpoint returns `202 Accepted` and periodic reconcile retries convergence from the persisted state file.
+
+On startup, vantage loads the persisted state file, restores global config and essential-tenant state from that snapshot, and completes an initial reconcile before serving traffic. `GET /policy` and `GET /runtime-policy` expose persisted desired state; `GET /policy/{tenant}/resolve` and `GET /admin/enabled` read the current live effective state.
 
 Adaptive throttling is optional (`--adaptive-enabled`). When enabled, userspace
 writes temporary wildcard runtime overrides for non-essential tenants when host
