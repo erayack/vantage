@@ -46,10 +46,37 @@ pub enum PolicySource {
 
 pub(crate) trait MapOps: Send + Sync {
     fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError>;
+    fn upsert_policies_batch(&self, entries: &[(TenantKey, Policy)]) -> Result<(), MapError> {
+        for (tenant, policy) in entries.iter().copied() {
+            self.upsert_policy(tenant, policy)?;
+        }
+        Ok(())
+    }
     fn delete_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
+    fn delete_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        for tenant in tenants.iter().copied() {
+            self.delete_policy(tenant)?;
+        }
+        Ok(())
+    }
     fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
     fn upsert_runtime_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError>;
+    fn upsert_runtime_policies_batch(
+        &self,
+        entries: &[(TenantKey, Policy)],
+    ) -> Result<(), MapError> {
+        for (tenant, policy) in entries.iter().copied() {
+            self.upsert_runtime_policy(tenant, policy)?;
+        }
+        Ok(())
+    }
     fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError>;
+    fn delete_runtime_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        for tenant in tenants.iter().copied() {
+            self.delete_runtime_policy(tenant)?;
+        }
+        Ok(())
+    }
     fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError>;
     fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError>;
     fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError>;
@@ -135,6 +162,45 @@ impl MapClient {
     /// Returns `MapError` when lock acquisition, map lookup, or map read fails.
     pub fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
         self.inner.get_runtime_policy(tenant)
+    }
+
+    /// Inserts or updates a batch of policy entries in `POLICY_MAP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map writes fail.
+    pub fn upsert_policies_batch(&self, entries: &[(TenantKey, Policy)]) -> Result<(), MapError> {
+        self.inner.upsert_policies_batch(entries)
+    }
+
+    /// Removes a batch of policy entries from `POLICY_MAP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map deletes fail.
+    pub fn delete_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        self.inner.delete_policies_batch(tenants)
+    }
+
+    /// Inserts or updates a batch of runtime override policy entries in `RUNTIME_POLICY_MAP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map writes fail.
+    pub fn upsert_runtime_policies_batch(
+        &self,
+        entries: &[(TenantKey, Policy)],
+    ) -> Result<(), MapError> {
+        self.inner.upsert_runtime_policies_batch(entries)
+    }
+
+    /// Removes a batch of runtime override policy entries from `RUNTIME_POLICY_MAP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError` when lock acquisition, map lookup, or map deletes fail.
+    pub fn delete_runtime_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        self.inner.delete_runtime_policies_batch(tenants)
     }
 
     /// Resolves the effective policy for a tenant using precedence rules.
@@ -337,6 +403,14 @@ impl MapOps for EbpfMapOps {
         self.delete_policy_from_map(POLICY_MAP_NAME, tenant)
     }
 
+    fn upsert_policies_batch(&self, entries: &[(TenantKey, Policy)]) -> Result<(), MapError> {
+        self.upsert_policies_to_map_batch(POLICY_MAP_NAME, entries)
+    }
+
+    fn delete_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        self.delete_policies_from_map_batch(POLICY_MAP_NAME, tenants, false)
+    }
+
     fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
         self.get_policy_from_map(POLICY_MAP_NAME, tenant)
     }
@@ -345,11 +419,22 @@ impl MapOps for EbpfMapOps {
         self.upsert_policy_to_map(RUNTIME_POLICY_MAP_NAME, tenant, policy)
     }
 
+    fn upsert_runtime_policies_batch(
+        &self,
+        entries: &[(TenantKey, Policy)],
+    ) -> Result<(), MapError> {
+        self.upsert_policies_to_map_batch(RUNTIME_POLICY_MAP_NAME, entries)
+    }
+
     fn delete_runtime_policy(&self, tenant: TenantKey) -> Result<(), MapError> {
         match self.delete_policy_from_map(RUNTIME_POLICY_MAP_NAME, tenant) {
             Err(MapError::MissingMap(RUNTIME_POLICY_MAP_NAME)) => Ok(()),
             other => other,
         }
+    }
+
+    fn delete_runtime_policies_batch(&self, tenants: &[TenantKey]) -> Result<(), MapError> {
+        self.delete_policies_from_map_batch(RUNTIME_POLICY_MAP_NAME, tenants, true)
     }
 
     fn get_runtime_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
@@ -452,6 +537,62 @@ impl MapOps for EbpfMapOps {
 }
 
 impl EbpfMapOps {
+    fn upsert_policies_to_map_batch(
+        &self,
+        map_name: &'static str,
+        entries: &[(TenantKey, Policy)],
+    ) -> Result<(), MapError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        {
+            let map = ebpf
+                .map_mut(map_name)
+                .ok_or(MapError::MissingMap(map_name))?;
+            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            for &(tenant, policy) in entries {
+                policy_map.insert(tenant, policy, 0)?;
+            }
+        }
+        drop(ebpf);
+
+        Ok(())
+    }
+
+    fn delete_policies_from_map_batch(
+        &self,
+        map_name: &'static str,
+        tenants: &[TenantKey],
+        missing_map_is_empty: bool,
+    ) -> Result<(), MapError> {
+        if tenants.is_empty() {
+            return Ok(());
+        }
+
+        let mut ebpf = self.ebpf.lock().map_err(|_| MapError::LockPoisoned)?;
+        let remove_result: Result<(), MapError> = {
+            let map = match ebpf.map_mut(map_name) {
+                Some(map) => map,
+                None if missing_map_is_empty => return Ok(()),
+                None => return Err(MapError::MissingMap(map_name)),
+            };
+            let mut policy_map = HashMap::<_, TenantKey, Policy>::try_from(map)?;
+            for tenant in tenants {
+                match policy_map.remove(tenant) {
+                    Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+                    Err(error) => return Err(MapError::Map(error)),
+                }
+            }
+            Ok(())
+        };
+        drop(ebpf);
+        remove_result?;
+
+        Ok(())
+    }
+
     fn collect_policy_keys_from_map(
         &self,
         map_name: &'static str,
@@ -718,6 +859,172 @@ mod tests {
         }
     }
 
+    struct FailingBatchOps {
+        policies: Mutex<BTreeMap<TenantKey, Policy>>,
+        fail_upsert_policy: TenantKey,
+    }
+
+    impl FailingBatchOps {
+        fn with_fail_upsert_policy(fail_upsert_policy: TenantKey) -> Arc<Self> {
+            Arc::new(Self {
+                policies: Mutex::new(BTreeMap::new()),
+                fail_upsert_policy,
+            })
+        }
+    }
+
+    impl MapOps for FailingBatchOps {
+        fn upsert_policy(&self, tenant: TenantKey, policy: Policy) -> Result<(), MapError> {
+            if tenant == self.fail_upsert_policy {
+                return Err(MapError::MissingMap(POLICY_MAP_NAME));
+            }
+            self.policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .insert(tenant, policy);
+            Ok(())
+        }
+
+        fn delete_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_policy(&self, tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            let policy = self
+                .policies
+                .lock()
+                .map_err(|_| MapError::LockPoisoned)?
+                .get(&tenant)
+                .copied();
+            Ok(policy)
+        }
+
+        fn upsert_runtime_policy(
+            &self,
+            _tenant: TenantKey,
+            _policy: Policy,
+        ) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn delete_runtime_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_runtime_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            Ok(None)
+        }
+
+        fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            let policies = self.policies.lock().map_err(|_| MapError::LockPoisoned)?;
+            Ok(policies.keys().copied().collect())
+        }
+
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
+            Ok(sample_global_stats())
+        }
+
+        fn seed_global_config(&self, _config: GlobalConfig) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn set_global_enabled(&self, _enabled: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            Ok(true)
+        }
+
+        fn set_flow_keys_live(&self, _flow_keys_live: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+            Ok(true)
+        }
+    }
+
+    struct MissingRuntimeMapBatchDeleteOps;
+
+    impl MapOps for MissingRuntimeMapBatchDeleteOps {
+        fn upsert_policy(&self, _tenant: TenantKey, _policy: Policy) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn delete_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            Ok(None)
+        }
+
+        fn upsert_runtime_policy(
+            &self,
+            _tenant: TenantKey,
+            _policy: Policy,
+        ) -> Result<(), MapError> {
+            Err(MapError::MissingMap(RUNTIME_POLICY_MAP_NAME))
+        }
+
+        fn delete_runtime_policy(&self, _tenant: TenantKey) -> Result<(), MapError> {
+            Err(MapError::MissingMap(RUNTIME_POLICY_MAP_NAME))
+        }
+
+        fn delete_runtime_policies_batch(&self, _tenants: &[TenantKey]) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_runtime_policy(&self, _tenant: TenantKey) -> Result<Option<Policy>, MapError> {
+            Ok(None)
+        }
+
+        fn collect_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn collect_runtime_policy_keys(&self) -> Result<Vec<TenantKey>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn collect_counters(&self) -> Result<Vec<(TenantKey, Counters)>, MapError> {
+            Ok(Vec::new())
+        }
+
+        fn read_global_stats(&self) -> Result<GlobalStats, MapError> {
+            Ok(sample_global_stats())
+        }
+
+        fn seed_global_config(&self, _config: GlobalConfig) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn set_global_enabled(&self, _enabled: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_global_enabled(&self) -> Result<bool, MapError> {
+            Ok(true)
+        }
+
+        fn set_flow_keys_live(&self, _flow_keys_live: bool) -> Result<(), MapError> {
+            Ok(())
+        }
+
+        fn get_flow_keys_live(&self) -> Result<bool, MapError> {
+            Ok(true)
+        }
+    }
+
     fn sample_global_stats() -> GlobalStats {
         GlobalStats {
             pass_pkts: 11,
@@ -870,6 +1177,164 @@ mod tests {
         };
         collected.sort_unstable();
         assert_eq!(collected, vec![key_a, key_b]);
+    }
+
+    #[test]
+    fn policy_batch_upsert_and_delete_work_with_fixture_storage() {
+        let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let key_a = TenantKey {
+            cgroup_id: 100,
+            http_path_hash: 0,
+            dst_port: 80,
+            proto: 6,
+            http_method: 0,
+        };
+        let key_b = TenantKey {
+            cgroup_id: 101,
+            http_path_hash: 1,
+            dst_port: 443,
+            proto: 6,
+            http_method: 1,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 300,
+            burst_tokens: 30,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+
+        let inserted = maps.upsert_policies_batch(&[(key_a, policy), (key_b, policy)]);
+        assert!(inserted.is_ok(), "policy batch insert should succeed");
+
+        let keys = maps.collect_policy_keys();
+        let Ok(mut keys) = keys else {
+            panic!("policy keys should be readable");
+        };
+        keys.sort_unstable();
+        assert_eq!(keys, vec![key_a, key_b]);
+
+        let deleted = maps.delete_policies_batch(&[key_a]);
+        assert!(deleted.is_ok(), "policy batch delete should succeed");
+
+        let remaining = maps.collect_policy_keys();
+        let Ok(remaining) = remaining else {
+            panic!("policy keys should be readable after batch delete");
+        };
+        assert_eq!(remaining, vec![key_b]);
+    }
+
+    #[test]
+    fn runtime_policy_batch_upsert_and_delete_work_with_fixture_storage() {
+        let fixture = FixtureMapOps::with_data(Vec::new(), sample_global_stats());
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+        let key_a = TenantKey {
+            cgroup_id: 110,
+            http_path_hash: 0,
+            dst_port: 8080,
+            proto: 6,
+            http_method: 0,
+        };
+        let key_b = TenantKey {
+            cgroup_id: 111,
+            http_path_hash: 1,
+            dst_port: 8443,
+            proto: 6,
+            http_method: 1,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 400,
+            burst_tokens: 40,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+
+        let inserted = maps.upsert_runtime_policies_batch(&[(key_a, policy), (key_b, policy)]);
+        assert!(
+            inserted.is_ok(),
+            "runtime policy batch insert should succeed"
+        );
+
+        let keys = maps.collect_runtime_policy_keys();
+        let Ok(mut keys) = keys else {
+            panic!("runtime policy keys should be readable");
+        };
+        keys.sort_unstable();
+        assert_eq!(keys, vec![key_a, key_b]);
+
+        let deleted = maps.delete_runtime_policies_batch(&[key_a]);
+        assert!(
+            deleted.is_ok(),
+            "runtime policy batch delete should succeed"
+        );
+
+        let remaining = maps.collect_runtime_policy_keys();
+        let Ok(remaining) = remaining else {
+            panic!("runtime policy keys should be readable after batch delete");
+        };
+        assert_eq!(remaining, vec![key_b]);
+    }
+
+    #[test]
+    fn policy_batch_upsert_propagates_errors_after_prior_entries() {
+        let key_ok = TenantKey {
+            cgroup_id: 500,
+            http_path_hash: 0,
+            dst_port: 80,
+            proto: 6,
+            http_method: 0,
+        };
+        let key_fail = TenantKey {
+            cgroup_id: 501,
+            http_path_hash: 0,
+            dst_port: 80,
+            proto: 6,
+            http_method: 0,
+        };
+        let policy = Policy {
+            rate_tokens_per_sec: 700,
+            burst_tokens: 70,
+            enabled: 1,
+            _pad: [0; 7],
+        };
+        let fixture = FailingBatchOps::with_fail_upsert_policy(key_fail);
+        let maps = MapClient::from_ops(Arc::clone(&fixture) as Arc<dyn MapOps>);
+
+        let result = maps.upsert_policies_batch(&[(key_ok, policy), (key_fail, policy)]);
+        assert!(
+            result.is_err(),
+            "batch upsert should fail on configured key"
+        );
+
+        let inserted_ok = maps.get_policy(key_ok);
+        let Ok(inserted_ok) = inserted_ok else {
+            panic!("first key should still be queryable");
+        };
+        assert_eq!(inserted_ok, Some(policy));
+
+        let inserted_fail = maps.get_policy(key_fail);
+        let Ok(inserted_fail) = inserted_fail else {
+            panic!("failed key should still be queryable");
+        };
+        assert_eq!(inserted_fail, None);
+    }
+
+    #[test]
+    fn runtime_policy_batch_delete_treats_missing_runtime_map_as_empty() {
+        let key = TenantKey {
+            cgroup_id: 600,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: 0,
+        };
+        let maps = MapClient::from_ops(Arc::new(MissingRuntimeMapBatchDeleteOps));
+
+        let deleted = maps.delete_runtime_policies_batch(&[key]);
+        assert!(
+            deleted.is_ok(),
+            "runtime batch delete should succeed when runtime map is missing"
+        );
     }
 
     #[test]

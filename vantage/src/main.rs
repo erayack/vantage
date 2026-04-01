@@ -323,8 +323,8 @@ fn reconcile_once(app: &AppState) -> anyhow::Result<u64> {
         &desired_base,
         base_keys,
         |tenant| app.maps.get_policy(tenant),
-        |tenant, policy| app.maps.upsert_policy(tenant, policy),
-        |tenant| app.maps.delete_policy(tenant),
+        |entries| app.maps.upsert_policies_batch(entries),
+        |tenants| app.maps.delete_policies_batch(tenants),
     )
     .context("failed to reconcile POLICY_MAP from persisted state")?;
 
@@ -336,8 +336,8 @@ fn reconcile_once(app: &AppState) -> anyhow::Result<u64> {
         &desired_runtime,
         runtime_keys,
         |tenant| app.maps.get_runtime_policy(tenant),
-        |tenant, policy| app.maps.upsert_runtime_policy(tenant, policy),
-        |tenant| app.maps.delete_runtime_policy(tenant),
+        |entries| app.maps.upsert_runtime_policies_batch(entries),
+        |tenants| app.maps.delete_runtime_policies_batch(tenants),
     )
     .context("failed to reconcile RUNTIME_POLICY_MAP from persisted state")?;
 
@@ -348,15 +348,16 @@ fn reconcile_policy_map<FGet, FUpsert, FDelete>(
     desired: &BTreeMap<TenantKey, Policy>,
     current_keys: Vec<TenantKey>,
     mut get_policy: FGet,
-    mut upsert_policy: FUpsert,
-    mut delete_policy: FDelete,
+    upsert_policies_batch: FUpsert,
+    delete_policies_batch: FDelete,
 ) -> Result<(), MapError>
 where
     FGet: FnMut(TenantKey) -> Result<Option<Policy>, MapError>,
-    FUpsert: FnMut(TenantKey, Policy) -> Result<(), MapError>,
-    FDelete: FnMut(TenantKey) -> Result<(), MapError>,
+    FUpsert: FnOnce(&[(TenantKey, Policy)]) -> Result<(), MapError>,
+    FDelete: FnOnce(&[TenantKey]) -> Result<(), MapError>,
 {
     let current_set: BTreeSet<_> = current_keys.into_iter().collect();
+    let mut to_upsert = Vec::new();
     for (&tenant, &policy) in desired {
         let needs_upsert = if current_set.contains(&tenant) {
             get_policy(tenant)? != Some(policy)
@@ -364,14 +365,22 @@ where
             true
         };
         if needs_upsert {
-            upsert_policy(tenant, policy)?;
+            to_upsert.push((tenant, policy));
         }
     }
 
+    let mut to_delete = Vec::new();
     for tenant in current_set {
         if !desired.contains_key(&tenant) {
-            delete_policy(tenant)?;
+            to_delete.push(tenant);
         }
+    }
+
+    if !to_upsert.is_empty() {
+        upsert_policies_batch(&to_upsert)?;
+    }
+    if !to_delete.is_empty() {
+        delete_policies_batch(&to_delete)?;
     }
 
     Ok(())
@@ -793,14 +802,18 @@ mod tests {
             &desired,
             vec![key_stale, key_same, key_extra],
             |tenant| Ok(current.borrow().get(&tenant).copied()),
-            |tenant, policy| {
-                current.borrow_mut().insert(tenant, policy);
-                upserts.borrow_mut().push(tenant);
+            |entries| {
+                for (tenant, policy) in entries.iter().copied() {
+                    current.borrow_mut().insert(tenant, policy);
+                    upserts.borrow_mut().push(tenant);
+                }
                 Ok(())
             },
-            |tenant| {
-                let _ = current.borrow_mut().remove(&tenant);
-                deletes.borrow_mut().push(tenant);
+            |tenants| {
+                for tenant in tenants.iter().copied() {
+                    let _ = current.borrow_mut().remove(&tenant);
+                    deletes.borrow_mut().push(tenant);
+                }
                 Ok(())
             },
         );
