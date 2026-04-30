@@ -1,5 +1,11 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_arch = "bpf", no_std)]
+#![cfg_attr(target_arch = "bpf", no_main)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+
+// Host builds exercise tests and clippy; the classifier entrypoint is only
+// emitted for the BPF target.
+#[cfg(not(target_arch = "bpf"))]
+fn main() {}
 
 use aya_ebpf::{
     bindings::{
@@ -17,6 +23,9 @@ use vantage_common::{
     HTTP_METHOD_POST, KERNEL_DROP_EVENT_SAMPLE_EVERY, LockedTokenState, Policy, TenantKey,
     TokenState, fallback_policy_keys,
 };
+
+#[cfg(test)]
+use vantage_common::PolicyMatchLevel;
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
 const STATE_MAP_MAX_ENTRIES: u32 = 4096;
@@ -84,69 +93,61 @@ static GLOBAL_CONFIG_MAP: Array<GlobalConfig> =
 static DROP_EVENTS: RingBuf = RingBuf::with_byte_size(DROP_EVENTS_BYTES, 0);
 
 #[classifier]
+#[allow(clippy::needless_pass_by_value)]
 pub fn vantage_tc(ctx: TcContext) -> i32 {
-    match try_vantage_tc(&ctx) {
-        Ok(verdict) => verdict,
-        Err(()) => TC_ACT_OK,
-    }
+    try_vantage_tc(&ctx)
 }
 
-fn try_vantage_tc(ctx: &TcContext) -> Result<i32, ()> {
-    if !is_filter_enabled() {
-        return Ok(TC_ACT_OK);
+fn try_vantage_tc(ctx: &TcContext) -> i32 {
+    let global_config = read_global_config();
+    if global_config.is_some_and(|(enabled, _)| !enabled) {
+        return TC_ACT_OK;
     }
+    let flow_keys_live = global_config.is_none_or(|(_, flow_keys_live)| flow_keys_live);
 
     let now_ns = monotonic_now_ns();
     let pkt_len = u64::from(ctx.len());
 
-    let Some(tenant_key) = flow_key_from_packet(ctx, is_flow_keys_live()) else {
+    let Some(tenant_key) = flow_key_from_packet(ctx, flow_keys_live) else {
         // Fail-open on parse failure.
-        update_global_stats(pkt_len, true, Some(DropReason::ParseFail));
-        return Ok(TC_ACT_OK);
+        update_global_stats_with_reason(pkt_len, true, DropReason::ParseFail);
+        return TC_ACT_OK;
     };
 
     let Some(policy) = read_policy_with_dual_fallback(tenant_key) else {
         update_counters(tenant_key, pkt_len, true);
-        update_global_stats(pkt_len, true, Some(DropReason::NoPolicy));
-        return Ok(TC_ACT_OK);
+        update_global_stats_with_reason(pkt_len, true, DropReason::NoPolicy);
+        return TC_ACT_OK;
     };
 
     if policy.enabled == 0 {
         update_counters(tenant_key, pkt_len, true);
-        update_global_stats(pkt_len, true, None);
-        return Ok(TC_ACT_OK);
+        update_global_stats(pkt_len, true);
+        return TC_ACT_OK;
     }
 
-    let passed = match decide_and_store_state(tenant_key, now_ns, &policy) {
-        Ok(passed) => passed,
-        Err(()) => {
-            let drop_pkts = update_counters(tenant_key, pkt_len, false);
-            update_global_stats(pkt_len, false, None);
-            maybe_emit_drop_event(tenant_key, now_ns, DropReason::StateStoreFail, drop_pkts);
-            return Ok(TC_ACT_SHOT);
-        }
+    let Ok(passed) = decide_and_store_state(tenant_key, now_ns, &policy) else {
+        let drop_pkts = update_counters(tenant_key, pkt_len, false);
+        update_global_stats(pkt_len, false);
+        maybe_emit_drop_event(tenant_key, now_ns, DropReason::StateStoreFail, drop_pkts);
+        return TC_ACT_SHOT;
     };
     let drop_pkts = update_counters(tenant_key, pkt_len, passed);
-    update_global_stats(
-        pkt_len,
-        passed,
-        if passed {
-            None
-        } else {
-            Some(DropReason::NoTokens)
-        },
-    );
     if passed {
-        Ok(TC_ACT_OK)
+        update_global_stats(pkt_len, true);
+        TC_ACT_OK
     } else {
+        update_global_stats_with_reason(pkt_len, false, DropReason::NoTokens);
         maybe_emit_drop_event(tenant_key, now_ns, DropReason::NoTokens, drop_pkts);
-        Ok(TC_ACT_SHOT)
+        TC_ACT_SHOT
     }
 }
 
 fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantKey> {
     let cgroup_id = extract_cgroup_id(ctx)?;
-    let packet_len = usize::try_from(ctx.len()).ok()?;
+    // Invariant: `TcContext::len()` is a u32 packet length; u32 -> usize is
+    // infallible on the supported 64-bit Linux eBPF target.
+    let packet_len = ctx.len() as usize;
     // Parser contract: all kernel packet reads are bounded.
     // L7 reads only inspect a small fixed payload prefix.
     let l3_offset = parse_l2_ipv4(ctx, packet_len)?;
@@ -161,7 +162,11 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
         });
     }
 
-    let dst_port = parse_l4_dst_port(ctx, packet_len, proto, l4_offset)?;
+    let dst_port = if proto_has_dst_port(proto) {
+        parse_l4_dst_port(ctx, packet_len, l4_offset)?
+    } else {
+        0
+    };
     let (http_method, http_path_hash) = parse_l7_http_selector(ctx, packet_len, proto, l4_offset);
 
     Some(TenantKey {
@@ -228,11 +233,6 @@ fn parse_l3_ipv4(ctx: &TcContext, packet_len: usize, l3_offset: usize) -> Option
 }
 
 fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> bool {
-    if policy.enabled == 0 {
-        state.last_refill_ns = now_ns;
-        return true;
-    }
-
     if policy.burst_tokens == 0 {
         state.last_refill_ns = now_ns;
         state.tokens = 0;
@@ -264,59 +264,45 @@ fn read_runtime_policy(key: TenantKey) -> Option<Policy> {
     unsafe { RUNTIME_POLICY_MAP.get(&key).copied() }
 }
 
-fn read_runtime_policy_with_fallback(key: TenantKey) -> Option<Policy> {
-    let (candidates, _, candidate_count) = fallback_policy_keys(key);
-    for candidate in candidates[..candidate_count].iter().copied() {
-        if let Some(policy) = read_runtime_policy(candidate) {
-            return Some(policy);
+macro_rules! read_policy_with_fallback {
+    ($key:expr, $read_policy:ident) => {{
+        let (candidates, _, candidate_count) = fallback_policy_keys($key);
+        let mut found_policy = None;
+        for candidate in candidates[..candidate_count].iter().copied() {
+            if let Some(policy) = $read_policy(candidate) {
+                found_policy = Some(policy);
+                break;
+            }
         }
-    }
-
-    None
-}
-
-fn read_base_policy_with_fallback(key: TenantKey) -> Option<Policy> {
-    let (candidates, _, candidate_count) = fallback_policy_keys(key);
-    for candidate in candidates[..candidate_count].iter().copied() {
-        if let Some(policy) = read_base_policy(candidate) {
-            return Some(policy);
-        }
-    }
-
-    None
+        found_policy
+    }};
 }
 
 fn read_policy_with_dual_fallback(key: TenantKey) -> Option<Policy> {
-    read_runtime_policy_with_fallback(key).or_else(|| read_base_policy_with_fallback(key))
+    read_policy_with_fallback!(key, read_runtime_policy)
+        .or_else(|| read_policy_with_fallback!(key, read_base_policy))
 }
 
 #[allow(unsafe_code)]
-fn is_filter_enabled() -> bool {
-    read_global_config().is_none_or(|config| config.enabled != 0)
-}
-
-#[allow(unsafe_code)]
-fn is_flow_keys_live() -> bool {
-    read_global_config().is_none_or(|config| config.flow_keys_live != 0)
-}
-
-#[allow(unsafe_code)]
-fn read_global_config() -> Option<GlobalConfig> {
+fn read_global_config() -> Option<(bool, bool)> {
     let config_ptr = GLOBAL_CONFIG_MAP.get_ptr(GLOBAL_CONFIG_INDEX)?;
-    // SAFETY: Pointer originates from a BPF array lookup at a fixed index
-    // and is copied out immediately in this invocation.
-    let config = unsafe { *config_ptr };
-    Some(config)
+    // SAFETY: Pointer originates from a BPF array lookup at a fixed index.
+    // Only the two u8 flag fields are read immediately, preserving the ABI
+    // layout while avoiding a full struct copy in the hot path.
+    let enabled = unsafe { (*config_ptr).enabled != 0 };
+    // SAFETY: Same map-value pointer as above; the field is read immediately.
+    let flow_keys_live = unsafe { (*config_ptr).flow_keys_live != 0 };
+    Some((enabled, flow_keys_live))
 }
 
-fn initial_state(policy: &Policy, now_ns: u64) -> TokenState {
+const fn initial_state(policy: &Policy, now_ns: u64) -> TokenState {
     TokenState {
         tokens: policy.burst_tokens,
         last_refill_ns: now_ns,
     }
 }
 
-fn initial_locked_state(policy: &Policy, now_ns: u64) -> LockedTokenState {
+const fn initial_locked_state(policy: &Policy, now_ns: u64) -> LockedTokenState {
     LockedTokenState::from_state(initial_state(policy, now_ns))
 }
 
@@ -373,12 +359,9 @@ fn refill_tokens(now_ns: u64, policy: &Policy, state: &mut TokenState) {
     // Keep arithmetic linker-friendly for eBPF: avoid wide multiply paths that
     // may lower to unsupported compiler builtins.
     let effective_rate = policy.rate_tokens_per_sec.min(NANOS_PER_SEC);
+    // Invariant: `rate_tokens_per_sec != 0` above and `effective_rate` is
+    // clamped to `NANOS_PER_SEC`, so this division always yields at least 1.
     let nanos_per_token = NANOS_PER_SEC / effective_rate;
-    if nanos_per_token == 0 {
-        state.tokens = policy.burst_tokens;
-        state.last_refill_ns = now_ns;
-        return;
-    }
 
     let elapsed_ns = now_ns.saturating_sub(state.last_refill_ns);
     let refill_tokens = elapsed_ns / nanos_per_token;
@@ -443,32 +426,48 @@ fn maybe_emit_drop_event(key: TenantKey, now_ns: u64, reason: DropReason, drop_p
 }
 
 #[allow(unsafe_code)]
-fn update_global_stats(pkt_len: u64, passed: bool, reason: Option<DropReason>) {
+fn update_global_stats(pkt_len: u64, passed: bool) {
     if let Some(stats_ptr) = GLOBAL_STATS_MAP.get_ptr_mut(GLOBAL_STATS_INDEX) {
         // SAFETY: Pointer originates from BPF array lookup and is used only
         // within this function invocation.
         let stats = unsafe { &mut *stats_ptr };
-        if passed {
-            stats.pass_pkts = stats.pass_pkts.saturating_add(1);
-            stats.pass_bytes = stats.pass_bytes.saturating_add(pkt_len);
-        } else {
-            stats.drop_pkts = stats.drop_pkts.saturating_add(1);
-            stats.drop_bytes = stats.drop_bytes.saturating_add(pkt_len);
+        update_global_count_buckets(stats, pkt_len, passed);
+    }
+}
+
+#[allow(unsafe_code)]
+fn update_global_stats_with_reason(pkt_len: u64, passed: bool, reason: DropReason) {
+    if let Some(stats_ptr) = GLOBAL_STATS_MAP.get_ptr_mut(GLOBAL_STATS_INDEX) {
+        // SAFETY: Pointer originates from BPF array lookup and is used only
+        // within this function invocation.
+        let stats = unsafe { &mut *stats_ptr };
+        update_global_count_buckets(stats, pkt_len, passed);
+        update_reason_bucket(stats, reason);
+    }
+}
+
+const fn update_global_count_buckets(stats: &mut GlobalStats, pkt_len: u64, passed: bool) {
+    if passed {
+        stats.pass_pkts = stats.pass_pkts.saturating_add(1);
+        stats.pass_bytes = stats.pass_bytes.saturating_add(pkt_len);
+    } else {
+        stats.drop_pkts = stats.drop_pkts.saturating_add(1);
+        stats.drop_bytes = stats.drop_bytes.saturating_add(pkt_len);
+    }
+}
+
+const fn update_reason_bucket(stats: &mut GlobalStats, reason: DropReason) {
+    match reason {
+        DropReason::NoTokens => {
+            stats.reasons.no_tokens = stats.reasons.no_tokens.saturating_add(1);
         }
-        if let Some(reason) = reason {
-            match reason {
-                DropReason::NoTokens => {
-                    stats.reasons.no_tokens = stats.reasons.no_tokens.saturating_add(1);
-                }
-                DropReason::NoPolicy => {
-                    stats.reasons.no_policy = stats.reasons.no_policy.saturating_add(1);
-                }
-                DropReason::ParseFail => {
-                    stats.reasons.parse_fail = stats.reasons.parse_fail.saturating_add(1);
-                }
-                DropReason::StateStoreFail => {}
-            }
+        DropReason::NoPolicy => {
+            stats.reasons.no_policy = stats.reasons.no_policy.saturating_add(1);
         }
+        DropReason::ParseFail => {
+            stats.reasons.parse_fail = stats.reasons.parse_fail.saturating_add(1);
+        }
+        DropReason::StateStoreFail => {}
     }
 }
 
@@ -483,15 +482,7 @@ const fn proto_has_dst_port(proto: u8) -> bool {
     proto == IPPROTO_TCP || proto == IPPROTO_UDP
 }
 
-fn parse_l4_dst_port(
-    ctx: &TcContext,
-    packet_len: usize,
-    proto: u8,
-    l4_offset: usize,
-) -> Option<u16> {
-    if !proto_has_dst_port(proto) {
-        return Some(0);
-    }
+fn parse_l4_dst_port(ctx: &TcContext, packet_len: usize, l4_offset: usize) -> Option<u16> {
     if packet_len < l4_offset + L4_DST_PORT_REL_OFFSET + 2 {
         return None;
     }
@@ -536,7 +527,9 @@ fn parse_l7_payload_offset(
     }
 
     if proto == IPPROTO_UDP {
-        let payload_offset = l4_offset.checked_add(UDP_HEADER_LEN)?;
+        // Invariant: `l4_offset` is derived from a u32-bounded packet length,
+        // `UDP_HEADER_LEN` is 8, and the eBPF target uses 64-bit usize.
+        let payload_offset = l4_offset + UDP_HEADER_LEN;
         if packet_len < payload_offset {
             return None;
         }
@@ -558,7 +551,9 @@ fn parse_tcp_payload_offset(ctx: &TcContext, packet_len: usize, l4_offset: usize
         return None;
     }
     let tcp_header_len = usize::from(data_offset_words) * 4;
-    let payload_offset = l4_offset.checked_add(tcp_header_len)?;
+    // Invariant: `l4_offset` is derived from a u32-bounded packet length,
+    // `tcp_header_len` is at most 60 bytes, and the eBPF target is 64-bit.
+    let payload_offset = l4_offset + tcp_header_len;
     if packet_len < payload_offset {
         return None;
     }
@@ -600,6 +595,8 @@ fn parse_http_path_hash(
     let mut idx = 0_usize;
     while idx < HTTP_PATH_HASH_MAX_BYTES {
         debug_assert!(path_start + idx < prefix.len());
+        // Invariant: `path_start` is 4 for GET or 5 for POST, and
+        // `idx < HTTP_PATH_HASH_MAX_BYTES` (64), so addition cannot overflow.
         let pos = path_start + idx;
         if pos >= read_len {
             return None;
@@ -615,7 +612,7 @@ fn parse_http_path_hash(
     None
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "bpf"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop {}
@@ -693,41 +690,44 @@ mod tests {
             http_method: 0,
         };
 
-        let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
-            fallback_policy_keys(key);
+        let (candidates, levels, candidate_count) = fallback_policy_keys(key);
 
-        assert_eq!(exact, key);
-        assert_eq!(method_path_wildcard, None);
+        assert_eq!(candidate_count, 4);
+        assert_eq!(candidates[0], key);
+        assert_eq!(levels[0], PolicyMatchLevel::Exact);
         assert_eq!(
-            path_wildcard,
-            Some(TenantKey {
+            candidates[1],
+            TenantKey {
                 cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: key.dst_port,
                 proto: IPPROTO_TCP,
                 http_method: 0,
-            })
+            }
         );
+        assert_eq!(levels[1], PolicyMatchLevel::PathWildcard);
         assert_eq!(
-            port_method_path_wildcard,
-            Some(TenantKey {
+            candidates[2],
+            TenantKey {
                 cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: IPPROTO_TCP,
                 http_method: 0,
-            })
+            }
         );
+        assert_eq!(levels[2], PolicyMatchLevel::PortMethodPathWildcard);
         assert_eq!(
-            full_wildcard,
-            Some(TenantKey {
+            candidates[3],
+            TenantKey {
                 cgroup_id: key.cgroup_id,
                 http_path_hash: 0,
                 dst_port: 0,
                 proto: 0,
                 http_method: 0,
-            })
+            }
         );
+        assert_eq!(levels[3], PolicyMatchLevel::FullWildcard);
     }
 
     #[test]
@@ -740,13 +740,11 @@ mod tests {
             http_method: 0,
         };
 
-        let (_exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
-            fallback_policy_keys(key);
+        let (candidates, levels, candidate_count) = fallback_policy_keys(key);
 
-        assert_eq!(path_wildcard, None);
-        assert_eq!(method_path_wildcard, None);
-        assert_eq!(port_method_path_wildcard, None);
-        assert_eq!(full_wildcard, None);
+        assert_eq!(candidate_count, 1);
+        assert_eq!(candidates[0], key);
+        assert_eq!(levels[0], PolicyMatchLevel::Exact);
     }
 
     #[test]
