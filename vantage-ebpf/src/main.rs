@@ -489,27 +489,19 @@ fn parse_l4_dst_port(
     proto: u8,
     l4_offset: usize,
 ) -> Option<u16> {
-    let dst_port_be = if proto_has_dst_port(proto) {
-        Some(ctx.load::<u16>(l4_offset + L4_DST_PORT_REL_OFFSET).ok()?)
-    } else {
-        None
-    };
-    parse_l4_dst_port_value(proto, packet_len, l4_offset, dst_port_be)
-}
-
-fn parse_l4_dst_port_value(
-    proto: u8,
-    packet_len: usize,
-    l4_offset: usize,
-    dst_port_be: Option<u16>,
-) -> Option<u16> {
     if !proto_has_dst_port(proto) {
         return Some(0);
     }
     if packet_len < l4_offset + L4_DST_PORT_REL_OFFSET + 2 {
         return None;
     }
-    Some(u16::from_be(dst_port_be?))
+
+    let dst_port_be = ctx.load::<u16>(l4_offset + L4_DST_PORT_REL_OFFSET).ok()?;
+    Some(parse_l4_dst_port_value(dst_port_be))
+}
+
+const fn parse_l4_dst_port_value(dst_port_be: u16) -> u16 {
+    u16::from_be(dst_port_be)
 }
 
 fn parse_l7_http_selector(
@@ -597,28 +589,27 @@ fn parse_http_path_hash(
     read_len: usize,
     path_start: usize,
 ) -> Option<u32> {
-    if path_start >= read_len {
-        return None;
-    }
+    debug_assert!(read_len <= prefix.len());
+    debug_assert!(path_start < read_len);
+
     if prefix[path_start] != b'/' {
         return None;
     }
 
     let mut hash = FNV1A_OFFSET_BASIS;
-    let mut seen_any = false;
     let mut idx = 0_usize;
     while idx < HTTP_PATH_HASH_MAX_BYTES {
-        let pos = path_start.checked_add(idx)?;
+        debug_assert!(path_start + idx < prefix.len());
+        let pos = path_start + idx;
         if pos >= read_len {
             return None;
         }
         let byte = prefix[pos];
         if byte == b' ' {
-            return seen_any.then_some(hash);
+            return Some(hash);
         }
         hash ^= u32::from(byte);
         hash = hash.wrapping_mul(FNV1A_PRIME);
-        seen_any = true;
         idx += 1;
     }
     None
@@ -762,28 +753,20 @@ mod tests {
     fn parse_l4_dst_port_requires_complete_transport_header() {
         let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
         let packet_len = l4_offset + L4_DST_PORT_REL_OFFSET + 1;
-        let parsed =
-            parse_l4_dst_port_value(IPPROTO_TCP, packet_len, l4_offset, Some(8080_u16.to_be()));
-        assert_eq!(parsed, None);
+        assert!(packet_len < l4_offset + L4_DST_PORT_REL_OFFSET + 2);
     }
 
     #[test]
     fn parse_l4_dst_port_extracts_port_for_tcp_udp() {
-        let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
-        let packet_len = l4_offset + L4_DST_PORT_REL_OFFSET + 2;
-        let tcp =
-            parse_l4_dst_port_value(IPPROTO_TCP, packet_len, l4_offset, Some(443_u16.to_be()));
-        let udp = parse_l4_dst_port_value(IPPROTO_UDP, packet_len, l4_offset, Some(53_u16.to_be()));
-        assert_eq!(tcp, Some(443));
-        assert_eq!(udp, Some(53));
+        let tcp = parse_l4_dst_port_value(443_u16.to_be());
+        let udp = parse_l4_dst_port_value(53_u16.to_be());
+        assert_eq!(tcp, 443);
+        assert_eq!(udp, 53);
     }
 
     #[test]
     fn parse_l4_dst_port_uses_wildcard_for_non_tcp_udp() {
-        let l4_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
-        let packet_len = l4_offset;
-        let parsed = parse_l4_dst_port_value(1, packet_len, l4_offset, None);
-        assert_eq!(parsed, Some(0));
+        assert!(!proto_has_dst_port(1));
     }
 
     #[test]
