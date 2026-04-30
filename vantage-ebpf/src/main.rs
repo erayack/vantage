@@ -18,14 +18,13 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::TcContext,
 };
+#[cfg(test)]
+use vantage_common::PolicyMatchLevel;
 use vantage_common::{
     Counters, DropEvent, DropReason, GlobalConfig, GlobalStats, HTTP_METHOD_ANY, HTTP_METHOD_GET,
     HTTP_METHOD_POST, KERNEL_DROP_EVENT_SAMPLE_EVERY, LockedTokenState, Policy, TenantKey,
     TokenState, fallback_policy_keys,
 };
-
-#[cfg(test)]
-use vantage_common::PolicyMatchLevel;
 
 const HASH_MAP_MAX_ENTRIES: u32 = 4096;
 const STATE_MAP_MAX_ENTRIES: u32 = 4096;
@@ -162,11 +161,7 @@ fn flow_key_from_packet(ctx: &TcContext, flow_keys_live: bool) -> Option<TenantK
         });
     }
 
-    let dst_port = if proto_has_dst_port(proto) {
-        parse_l4_dst_port(ctx, packet_len, l4_offset)?
-    } else {
-        0
-    };
+    let dst_port = parse_l4_dst_port(ctx, packet_len, proto, l4_offset)?;
     let (http_method, http_path_hash) = parse_l7_http_selector(ctx, packet_len, proto, l4_offset);
 
     Some(TenantKey {
@@ -250,26 +245,15 @@ fn apply_token_bucket(now_ns: u64, policy: &Policy, state: &mut TokenState) -> b
     true
 }
 
-#[allow(unsafe_code)]
-fn read_base_policy(key: TenantKey) -> Option<Policy> {
-    // SAFETY: The map value is copied out immediately and never held across
-    // helper calls, avoiding aliasing/lifetime pitfalls of raw map pointers.
-    unsafe { POLICY_MAP.get(&key).copied() }
-}
-
-#[allow(unsafe_code)]
-fn read_runtime_policy(key: TenantKey) -> Option<Policy> {
-    // SAFETY: The map value is copied out immediately and never held across
-    // helper calls, avoiding aliasing/lifetime pitfalls of raw map pointers.
-    unsafe { RUNTIME_POLICY_MAP.get(&key).copied() }
-}
-
 macro_rules! read_policy_with_fallback {
-    ($key:expr, $read_policy:ident) => {{
+    ($key:expr, $map:ident) => {{
         let (candidates, _, candidate_count) = fallback_policy_keys($key);
         let mut found_policy = None;
         for candidate in candidates[..candidate_count].iter().copied() {
-            if let Some(policy) = $read_policy(candidate) {
+            // SAFETY: The map value is copied out immediately and never held
+            // across helper calls, avoiding aliasing/lifetime pitfalls of raw
+            // map pointers.
+            if let Some(policy) = unsafe { $map.get(&candidate).copied() } {
                 found_policy = Some(policy);
                 break;
             }
@@ -278,9 +262,10 @@ macro_rules! read_policy_with_fallback {
     }};
 }
 
+#[allow(unsafe_code)]
 fn read_policy_with_dual_fallback(key: TenantKey) -> Option<Policy> {
-    read_policy_with_fallback!(key, read_runtime_policy)
-        .or_else(|| read_policy_with_fallback!(key, read_base_policy))
+    read_policy_with_fallback!(key, RUNTIME_POLICY_MAP)
+        .or_else(|| read_policy_with_fallback!(key, POLICY_MAP))
 }
 
 #[allow(unsafe_code)]
@@ -350,6 +335,14 @@ fn decide_and_store_state(key: TenantKey, now_ns: u64, policy: &Policy) -> Resul
     Err(())
 }
 
+const fn effective_refill_rate(rate_tokens_per_sec: u64) -> u64 {
+    if rate_tokens_per_sec > NANOS_PER_SEC {
+        NANOS_PER_SEC
+    } else {
+        rate_tokens_per_sec
+    }
+}
+
 fn refill_tokens(now_ns: u64, policy: &Policy, state: &mut TokenState) {
     if policy.rate_tokens_per_sec == 0 {
         state.last_refill_ns = now_ns;
@@ -358,7 +351,7 @@ fn refill_tokens(now_ns: u64, policy: &Policy, state: &mut TokenState) {
 
     // Keep arithmetic linker-friendly for eBPF: avoid wide multiply paths that
     // may lower to unsupported compiler builtins.
-    let effective_rate = policy.rate_tokens_per_sec.min(NANOS_PER_SEC);
+    let effective_rate = effective_refill_rate(policy.rate_tokens_per_sec);
     // Invariant: `rate_tokens_per_sec != 0` above and `effective_rate` is
     // clamped to `NANOS_PER_SEC`, so this division always yields at least 1.
     let nanos_per_token = NANOS_PER_SEC / effective_rate;
@@ -482,7 +475,16 @@ const fn proto_has_dst_port(proto: u8) -> bool {
     proto == IPPROTO_TCP || proto == IPPROTO_UDP
 }
 
-fn parse_l4_dst_port(ctx: &TcContext, packet_len: usize, l4_offset: usize) -> Option<u16> {
+fn parse_l4_dst_port(
+    ctx: &TcContext,
+    packet_len: usize,
+    proto: u8,
+    l4_offset: usize,
+) -> Option<u16> {
+    if !proto_has_dst_port(proto) {
+        return Some(0);
+    }
+
     if packet_len < l4_offset + L4_DST_PORT_REL_OFFSET + 2 {
         return None;
     }
