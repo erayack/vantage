@@ -265,23 +265,8 @@ fn read_runtime_policy(key: TenantKey) -> Option<Policy> {
 }
 
 fn read_runtime_policy_with_fallback(key: TenantKey) -> Option<Policy> {
-    let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
-        fallback_policy_keys(key);
-    let candidates = [
-        Some(exact),
-        path_wildcard,
-        method_path_wildcard,
-        port_method_path_wildcard,
-        full_wildcard,
-    ];
-    let mut prior: Option<TenantKey> = None;
-
-    for candidate in candidates.into_iter().flatten() {
-        if prior == Some(candidate) {
-            continue;
-        }
-        prior = Some(candidate);
-
+    let (candidates, _, candidate_count) = fallback_policy_keys(key);
+    for candidate in candidates[..candidate_count].iter().copied() {
         if let Some(policy) = read_runtime_policy(candidate) {
             return Some(policy);
         }
@@ -291,23 +276,8 @@ fn read_runtime_policy_with_fallback(key: TenantKey) -> Option<Policy> {
 }
 
 fn read_base_policy_with_fallback(key: TenantKey) -> Option<Policy> {
-    let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
-        fallback_policy_keys(key);
-    let candidates = [
-        Some(exact),
-        path_wildcard,
-        method_path_wildcard,
-        port_method_path_wildcard,
-        full_wildcard,
-    ];
-    let mut prior: Option<TenantKey> = None;
-
-    for candidate in candidates.into_iter().flatten() {
-        if prior == Some(candidate) {
-            continue;
-        }
-        prior = Some(candidate);
-
+    let (candidates, _, candidate_count) = fallback_policy_keys(key);
+    for candidate in candidates[..candidate_count].iter().copied() {
         if let Some(policy) = read_base_policy(candidate) {
             return Some(policy);
         }

@@ -10,7 +10,6 @@ use aya::{
 use thiserror::Error;
 use vantage_common::{
     Counters, GlobalConfig, GlobalStats, Policy, PolicyMatchLevel, TenantKey, fallback_policy_keys,
-    policy_match_level,
 };
 
 const GLOBAL_STATS_INDEX: u32 = 0;
@@ -234,30 +233,13 @@ impl MapClient {
     where
         F: FnMut(TenantKey) -> Result<Option<Policy>, MapError>,
     {
-        let (exact, path_wildcard, method_path_wildcard, port_method_path_wildcard, full_wildcard) =
-            fallback_policy_keys(requested);
-        let candidates = [
-            Some(exact),
-            path_wildcard,
-            method_path_wildcard,
-            port_method_path_wildcard,
-            full_wildcard,
-        ];
-        let mut prior: Option<TenantKey> = None;
-
-        for candidate in candidates.into_iter().flatten() {
-            if prior == Some(candidate) {
-                continue;
-            }
-            prior = Some(candidate);
-
+        let (candidates, levels, candidate_count) = fallback_policy_keys(requested);
+        for (index, candidate) in candidates[..candidate_count].iter().copied().enumerate() {
             if let Some(policy) = getter(candidate)? {
-                let level =
-                    policy_match_level(requested, candidate).unwrap_or(PolicyMatchLevel::Exact);
                 return Ok(Some(ResolvedPolicy {
                     requested,
                     matched: candidate,
-                    match_level: level,
+                    match_level: levels[index],
                     policy,
                     source,
                 }));

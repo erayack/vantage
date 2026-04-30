@@ -64,105 +64,71 @@ pub enum PolicyMatchLevel {
 /// 5. full wildcard `(cgroup_id, 0, 0, 0, 0)`
 pub const fn fallback_policy_keys(
     key: TenantKey,
-) -> (
-    TenantKey,
-    Option<TenantKey>,
-    Option<TenantKey>,
-    Option<TenantKey>,
-    Option<TenantKey>,
-) {
-    let exact_key = key;
-    let path_wildcard_key = if key.http_path_hash != 0 {
-        Some(TenantKey {
-            cgroup_id: key.cgroup_id,
-            http_path_hash: 0,
-            dst_port: key.dst_port,
-            proto: key.proto,
-            http_method: key.http_method,
-        })
-    } else {
-        None
+) -> ([TenantKey; 5], [PolicyMatchLevel; 5], usize) {
+    let path_wildcard = TenantKey {
+        cgroup_id: key.cgroup_id,
+        http_path_hash: 0,
+        dst_port: key.dst_port,
+        proto: key.proto,
+        http_method: key.http_method,
     };
-    let method_path_wildcard_key = if key.http_method != 0 || key.http_path_hash != 0 {
-        Some(TenantKey {
-            cgroup_id: key.cgroup_id,
-            http_path_hash: 0,
-            dst_port: key.dst_port,
-            proto: key.proto,
-            http_method: 0,
-        })
-    } else {
-        None
+    let method_path_wildcard = TenantKey {
+        cgroup_id: key.cgroup_id,
+        http_path_hash: 0,
+        dst_port: key.dst_port,
+        proto: key.proto,
+        http_method: 0,
     };
-    let port_method_path_wildcard_key =
-        if key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
-            Some(TenantKey {
-                cgroup_id: key.cgroup_id,
-                http_path_hash: 0,
-                dst_port: 0,
-                proto: key.proto,
-                http_method: 0,
-            })
-        } else {
-            None
-        };
-    let full_wildcard_key =
-        if key.proto != 0 || key.dst_port != 0 || key.http_method != 0 || key.http_path_hash != 0 {
-            Some(TenantKey {
-                cgroup_id: key.cgroup_id,
-                http_path_hash: 0,
-                dst_port: 0,
-                proto: 0,
-                http_method: 0,
-            })
-        } else {
-            None
-        };
+    let port_method_path_wildcard = TenantKey {
+        cgroup_id: key.cgroup_id,
+        http_path_hash: 0,
+        dst_port: 0,
+        proto: key.proto,
+        http_method: 0,
+    };
+    let full_wildcard = TenantKey {
+        cgroup_id: key.cgroup_id,
+        http_path_hash: 0,
+        dst_port: 0,
+        proto: 0,
+        http_method: 0,
+    };
 
-    (
-        exact_key,
-        path_wildcard_key,
-        method_path_wildcard_key,
-        port_method_path_wildcard_key,
-        full_wildcard_key,
-    )
+    let mut candidates = [key; 5];
+    let mut levels = [PolicyMatchLevel::Exact; 5];
+    let mut len = 1;
+
+    if key.http_path_hash != 0 {
+        candidates[len] = path_wildcard;
+        levels[len] = PolicyMatchLevel::PathWildcard;
+        len += 1;
+    }
+    if key.http_method != 0 {
+        candidates[len] = method_path_wildcard;
+        levels[len] = PolicyMatchLevel::MethodPathWildcard;
+        len += 1;
+    }
+    if key.dst_port != 0 {
+        candidates[len] = port_method_path_wildcard;
+        levels[len] = PolicyMatchLevel::PortMethodPathWildcard;
+        len += 1;
+    }
+    if key.proto != 0 {
+        candidates[len] = full_wildcard;
+        levels[len] = PolicyMatchLevel::FullWildcard;
+        len += 1;
+    }
+
+    (candidates, levels, len)
 }
 
 #[must_use]
 pub fn policy_match_level(requested: TenantKey, matched: TenantKey) -> Option<PolicyMatchLevel> {
-    let (
-        exact_key,
-        path_wildcard_key,
-        method_path_wildcard_key,
-        port_method_path_wildcard_key,
-        full_wildcard_key,
-    ) = fallback_policy_keys(requested);
-    if matched == exact_key {
-        return Some(PolicyMatchLevel::Exact);
-    }
-
-    if let Some(path_wildcard) = path_wildcard_key
-        && matched == path_wildcard
-    {
-        return Some(PolicyMatchLevel::PathWildcard);
-    }
-
-    if let Some(method_path_wildcard) = method_path_wildcard_key
-        && matched == method_path_wildcard
-    {
-        return Some(PolicyMatchLevel::MethodPathWildcard);
-    }
-
-    if let Some(port_method_path_wildcard) = port_method_path_wildcard_key
-        && matched == port_method_path_wildcard
-    {
-        return Some(PolicyMatchLevel::PortMethodPathWildcard);
-    }
-
-    if let Some(full_wildcard) = full_wildcard_key
-        && matched == full_wildcard
-    {
-        return Some(PolicyMatchLevel::FullWildcard);
+    let (candidates, levels, candidate_count) = fallback_policy_keys(requested);
+    for (index, candidate) in candidates[..candidate_count].iter().enumerate() {
+        if matched == *candidate {
+            return Some(levels[index]);
+        }
     }
 
     None
@@ -369,19 +335,14 @@ mod tests {
             http_method: HTTP_METHOD_POST,
         };
 
-        let (exact, path, method_path, port_method_path, full) = fallback_policy_keys(key);
-        let Some(path) = path else {
-            panic!("path wildcard should exist");
-        };
-        let Some(method_path) = method_path else {
-            panic!("method+path wildcard should exist");
-        };
-        let Some(port_method_path) = port_method_path else {
-            panic!("port+method+path wildcard should exist");
-        };
-        let Some(full) = full else {
-            panic!("full wildcard should exist");
-        };
+        let (candidates, _, candidate_count) = fallback_policy_keys(key);
+        assert_eq!(candidate_count, 5);
+
+        let exact = candidates[0];
+        let path = candidates[1];
+        let method_path = candidates[2];
+        let port_method_path = candidates[3];
+        let full = candidates[4];
 
         assert_eq!(exact, key);
         assert_eq!(
@@ -443,6 +404,56 @@ mod tests {
         assert_eq!(
             policy_match_level(key, full),
             Some(PolicyMatchLevel::FullWildcard)
+        );
+    }
+
+    #[test]
+    fn fallback_policy_keys_shorten_chain_for_existing_wildcards() {
+        let key = TenantKey {
+            cgroup_id: 0x0a00_0001,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 6,
+            http_method: 0,
+        };
+
+        let (candidates, _, candidate_count) = fallback_policy_keys(key);
+        assert_eq!(candidate_count, 2);
+        assert_eq!(candidates[0], key);
+        assert_eq!(
+            candidates[1],
+            TenantKey {
+                cgroup_id: key.cgroup_id,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_policy_keys_do_not_emit_duplicate_method_only_states() {
+        let key = TenantKey {
+            cgroup_id: 0x0a00_0001,
+            http_path_hash: 0,
+            dst_port: 0,
+            proto: 0,
+            http_method: HTTP_METHOD_POST,
+        };
+
+        let (candidates, _, candidate_count) = fallback_policy_keys(key);
+        assert_eq!(candidate_count, 2);
+        assert_eq!(candidates[0], key);
+        assert_eq!(
+            candidates[1],
+            TenantKey {
+                cgroup_id: key.cgroup_id,
+                http_path_hash: 0,
+                dst_port: 0,
+                proto: 0,
+                http_method: 0,
+            }
         );
     }
 
