@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, path::PathBuf};
+use std::{fs, future::Future, io::ErrorKind, path::PathBuf};
 
 use thiserror::Error;
 use tracing::info;
@@ -9,6 +9,7 @@ use crate::{
     inference::{InferencePressure, InferencePressureSample},
     state::LastAppliedState,
     vantage_client::{AdmissionClient, ClientError, PolicyShape, PolicyTarget},
+    vllm::{VllmMetricsError, VllmMetricsSource},
 };
 
 const TOKEN_THROTTLE_HIGH_PERCENT: f64 = 90.0;
@@ -74,10 +75,20 @@ pub(crate) enum InferenceSourceError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(transparent)]
+    Vllm(#[from] VllmMetricsError),
 }
 
 pub(crate) trait InferenceSource {
-    fn sample(&self) -> Result<InferencePressureSample, InferenceSourceError>;
+    fn sample(
+        &self,
+    ) -> impl Future<Output = Result<InferencePressureSample, InferenceSourceError>> + Send;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ConfiguredInferenceSource {
+    File(FileInferenceSource),
+    Vllm(VllmMetricsSource),
 }
 
 impl FileInferenceSource {
@@ -90,7 +101,7 @@ impl FileInferenceSource {
 }
 
 impl InferenceSource for FileInferenceSource {
-    fn sample(&self) -> Result<InferencePressureSample, InferenceSourceError> {
+    async fn sample(&self) -> Result<InferencePressureSample, InferenceSourceError> {
         let Some(path) = &self.path else {
             return Ok(InferencePressureSample::empty(
                 self.default_token_budget_per_minute,
@@ -119,6 +130,15 @@ impl InferenceSource for FileInferenceSource {
     }
 }
 
+impl InferenceSource for ConfiguredInferenceSource {
+    async fn sample(&self) -> Result<InferencePressureSample, InferenceSourceError> {
+        match self {
+            Self::File(source) => source.sample().await,
+            Self::Vllm(source) => source.sample().await,
+        }
+    }
+}
+
 impl<Client, Gpu, Inference> AdmissionController<Client, Gpu, Inference>
 where
     Client: AdmissionClient,
@@ -143,7 +163,7 @@ where
 
     pub(crate) async fn tick(&mut self) -> Result<(), ControllerError> {
         let gpu_sample = self.gpu_source.sample()?;
-        let inference_sample = self.inference_source.sample()?;
+        let inference_sample = self.inference_source.sample().await?;
         let desired = decide_admission(
             &self.config,
             self.mode,
@@ -282,9 +302,15 @@ mod tests {
     use crate::{
         config::Config,
         gpu::{GpuError, GpuUtilSample, GpuUtilSource},
+        http_client::HttpClientError,
         inference::InferencePressureSample,
         vantage_client::{ClientError, PolicyShape, PolicyTarget},
+        vllm::{metrics_to_pressure_sample, parse_vllm_metrics},
     };
+
+    const VLLM_NORMAL: &str = include_str!("../fixtures/vllm_metrics_normal.prom");
+    const VLLM_THROTTLED: &str = include_str!("../fixtures/vllm_metrics_throttled.prom");
+    const VLLM_EXHAUSTED: &str = include_str!("../fixtures/vllm_metrics_exhausted.prom");
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ClientCall {
@@ -324,7 +350,9 @@ mod tests {
                     .fail_after_calls
                     .is_some_and(|limit| calls.len() >= limit)
                 {
-                    return Err(ClientError::InvalidResponse("fixture failure".to_owned()));
+                    return Err(ClientError::Http(HttpClientError::InvalidResponse(
+                        "fixture failure".to_owned(),
+                    )));
                 }
                 calls.push(call);
             }
@@ -371,7 +399,7 @@ mod tests {
     struct FixedInference(InferencePressureSample);
 
     impl super::InferenceSource for FixedInference {
-        fn sample(&self) -> Result<InferencePressureSample, super::InferenceSourceError> {
+        async fn sample(&self) -> Result<InferencePressureSample, super::InferenceSourceError> {
             Ok(self.0)
         }
     }
@@ -397,6 +425,7 @@ mod tests {
             token_budget_per_minute: 100,
             kv_cache_used_bytes: kv_used,
             kv_cache_capacity_bytes: Some(100),
+            kv_cache_percent: None,
             active_requests: None,
             queued_requests: None,
         }
@@ -630,5 +659,67 @@ mod tests {
 
         assert_eq!(desired.mode, AdmissionMode::Normal);
         assert!(desired.runtime_policy.is_none());
+    }
+
+    #[test]
+    fn vllm_normal_fixture_decides_normal() {
+        let config = config(true);
+        let parsed = parse_vllm_metrics(VLLM_NORMAL);
+        let Ok(parsed) = parsed else {
+            panic!("fixture should parse");
+        };
+        let inference = metrics_to_pressure_sample(parsed, 100, 1);
+        let desired = decide_admission(
+            &config,
+            AdmissionMode::Normal,
+            None,
+            inference,
+            inference.pressure(),
+        );
+
+        assert_eq!(desired.mode, AdmissionMode::Normal);
+    }
+
+    #[test]
+    fn vllm_throttled_fixture_decides_throttled() {
+        let config = config(true);
+        let parsed = parse_vllm_metrics(VLLM_THROTTLED);
+        let Ok(parsed) = parsed else {
+            panic!("fixture should parse");
+        };
+        let inference = metrics_to_pressure_sample(parsed, 100, 1);
+        let desired = decide_admission(
+            &config,
+            AdmissionMode::Normal,
+            None,
+            inference,
+            inference.pressure(),
+        );
+
+        assert_eq!(
+            desired.mode,
+            AdmissionMode::Throttled {
+                reason: ThrottleReason::KvCache
+            }
+        );
+    }
+
+    #[test]
+    fn vllm_exhausted_fixture_decides_exhausted() {
+        let config = config(true);
+        let parsed = parse_vllm_metrics(VLLM_EXHAUSTED);
+        let Ok(parsed) = parsed else {
+            panic!("fixture should parse");
+        };
+        let inference = metrics_to_pressure_sample(parsed, 100, 1);
+        let desired = decide_admission(
+            &config,
+            AdmissionMode::Normal,
+            None,
+            inference,
+            inference.pressure(),
+        );
+
+        assert_eq!(desired.mode, AdmissionMode::Exhausted);
     }
 }

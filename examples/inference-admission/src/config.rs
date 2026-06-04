@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Parser)]
@@ -80,15 +80,40 @@ pub(crate) struct Cli {
     throttle_burst_tokens: u64,
     #[arg(long, env = "VANTAGE_INFERENCE_DISABLED_ON_EXHAUSTION")]
     disabled_on_exhaustion: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = InferenceMetricsSourceMode::File,
+        env = "VANTAGE_INFERENCE_METRICS_SOURCE"
+    )]
+    metrics_source: InferenceMetricsSourceMode,
     #[arg(long, env = "VANTAGE_INFERENCE_METRICS_FILE_PATH")]
     metrics_file_path: Option<PathBuf>,
     #[arg(long, env = "VANTAGE_INFERENCE_GPU_UTIL_FILE_PATH")]
     gpu_util_file_path: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8000",
+        env = "VANTAGE_INFERENCE_VLLM_METRICS_BASE_URL"
+    )]
+    vllm_metrics_base_url: String,
+    #[arg(
+        long,
+        default_value = "/metrics",
+        env = "VANTAGE_INFERENCE_VLLM_METRICS_PATH"
+    )]
+    vllm_metrics_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TenantSelector {
     pub(crate) cgroup_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InferenceMetricsSourceMode {
+    File,
+    Vllm,
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +133,11 @@ pub(crate) struct Config {
     pub(crate) throttle_rate_tokens_per_sec: u64,
     pub(crate) throttle_burst_tokens: u64,
     pub(crate) disabled_on_exhaustion: bool,
+    pub(crate) metrics_source: InferenceMetricsSourceMode,
     pub(crate) metrics_file_path: Option<PathBuf>,
     pub(crate) gpu_util_file_path: Option<PathBuf>,
+    pub(crate) vllm_metrics_base_url: String,
+    pub(crate) vllm_metrics_path: String,
 }
 
 #[derive(Debug, Error)]
@@ -151,8 +179,11 @@ impl Config {
             throttle_rate_tokens_per_sec: cli.throttle_rate_tokens_per_sec.max(1),
             throttle_burst_tokens: cli.throttle_burst_tokens.max(1),
             disabled_on_exhaustion: cli.disabled_on_exhaustion,
+            metrics_source: cli.metrics_source,
             metrics_file_path: cli.metrics_file_path,
             gpu_util_file_path: cli.gpu_util_file_path,
+            vllm_metrics_base_url: cli.vllm_metrics_base_url.trim_end_matches('/').to_owned(),
+            vllm_metrics_path: normalize_http_path(&cli.vllm_metrics_path),
         }
     }
 }
@@ -229,5 +260,38 @@ mod tests {
         assert_eq!(config.tick_ms, 100);
         assert!((config.gpu_low_watermark_percent - 79.0).abs() < f64::EPSILON);
         assert_eq!(config.token_budget_per_minute, 1);
+    }
+
+    #[test]
+    fn defaults_to_file_metrics_source() {
+        let parsed = Config::try_from_iter(["vantage-inference-admission", "--tenant", "7"]);
+        let Ok(config) = parsed else {
+            panic!("config should parse");
+        };
+        assert_eq!(
+            config.metrics_source,
+            super::InferenceMetricsSourceMode::File
+        );
+    }
+
+    #[test]
+    fn parses_vllm_metrics_source_and_normalizes_path() {
+        let parsed = Config::try_from_iter([
+            "vantage-inference-admission",
+            "--tenant",
+            "7",
+            "--metrics-source",
+            "vllm",
+            "--vllm-metrics-path",
+            "metrics",
+        ]);
+        let Ok(config) = parsed else {
+            panic!("config should parse");
+        };
+        assert_eq!(
+            config.metrics_source,
+            super::InferenceMetricsSourceMode::Vllm
+        );
+        assert_eq!(config.vllm_metrics_path, "/metrics");
     }
 }
