@@ -1,0 +1,15 @@
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache utilization.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc 0.95
+# HELP vllm:num_requests_waiting Number of waiting requests.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting 8
+# HELP vllm:num_requests_running Number of running requests.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 16
+# HELP vllm:prompt_tokens_total Prompt tokens in the current synthetic demo window.
+# TYPE vllm:prompt_tokens_total counter
+vllm:prompt_tokens_total 50
+# HELP vllm:generation_tokens_total Generation tokens in the current synthetic demo window.
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total 30

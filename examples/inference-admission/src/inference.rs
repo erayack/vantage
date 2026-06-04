@@ -1,13 +1,19 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 pub(crate) struct InferencePressureSample {
     pub(crate) ts_unix_ms: u64,
     pub(crate) tokens_used_current_minute: u64,
     pub(crate) token_budget_per_minute: u64,
+    #[serde(default)]
     pub(crate) kv_cache_used_bytes: Option<u64>,
+    #[serde(default)]
     pub(crate) kv_cache_capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) kv_cache_percent: Option<f64>,
+    #[serde(default)]
     pub(crate) active_requests: Option<u64>,
+    #[serde(default)]
     pub(crate) queued_requests: Option<u64>,
 }
 
@@ -27,6 +33,7 @@ impl InferencePressureSample {
             token_budget_per_minute,
             kv_cache_used_bytes: None,
             kv_cache_capacity_bytes: None,
+            kv_cache_percent: None,
             active_requests: None,
             queued_requests: None,
         }
@@ -38,12 +45,14 @@ impl InferencePressureSample {
             self.tokens_used_current_minute.min(token_budget),
             token_budget,
         );
-        let kv_cache_percent = match (self.kv_cache_used_bytes, self.kv_cache_capacity_bytes) {
-            (Some(used), Some(capacity)) if capacity > 0 => {
-                Some(ratio_percent(used.min(capacity), capacity))
+        let kv_cache_percent = self.kv_cache_percent.map(clamp_percent).or_else(|| {
+            match (self.kv_cache_used_bytes, self.kv_cache_capacity_bytes) {
+                (Some(used), Some(capacity)) if capacity > 0 => {
+                    Some(ratio_percent(used.min(capacity), capacity))
+                }
+                _ => None,
             }
-            _ => None,
-        };
+        });
 
         InferencePressure {
             token_budget_percent,
@@ -51,6 +60,14 @@ impl InferencePressureSample {
             active_requests: self.active_requests,
             queued_requests: self.queued_requests,
         }
+    }
+}
+
+const fn clamp_percent(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        100.0
     }
 }
 
@@ -78,6 +95,7 @@ mod tests {
             token_budget_per_minute: 100,
             kv_cache_used_bytes: Some(750),
             kv_cache_capacity_bytes: Some(1_000),
+            kv_cache_percent: None,
             active_requests: Some(3),
             queued_requests: Some(4),
         };
@@ -97,6 +115,7 @@ mod tests {
             token_budget_per_minute: 100,
             kv_cache_used_bytes: Some(750),
             kv_cache_capacity_bytes: Some(0),
+            kv_cache_percent: None,
             active_requests: None,
             queued_requests: None,
         };
@@ -112,10 +131,37 @@ mod tests {
             token_budget_per_minute: 100,
             kv_cache_used_bytes: None,
             kv_cache_capacity_bytes: None,
+            kv_cache_percent: None,
             active_requests: None,
             queued_requests: None,
         };
 
         assert!((sample.pressure().token_budget_percent - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn explicit_kv_percent_takes_precedence() {
+        let sample = InferencePressureSample {
+            ts_unix_ms: 1,
+            tokens_used_current_minute: 0,
+            token_budget_per_minute: 100,
+            kv_cache_used_bytes: Some(10),
+            kv_cache_capacity_bytes: Some(100),
+            kv_cache_percent: Some(90.0),
+            active_requests: None,
+            queued_requests: None,
+        };
+
+        assert_eq!(sample.pressure().kv_cache_percent, Some(90.0));
+    }
+
+    #[test]
+    fn old_file_json_without_kv_percent_still_parses() {
+        let raw = r#"{"ts_unix_ms":1,"tokens_used_current_minute":2,"token_budget_per_minute":10}"#;
+        let parsed = serde_json::from_str::<InferencePressureSample>(raw);
+        let Ok(parsed) = parsed else {
+            panic!("old fixture should parse");
+        };
+        assert_eq!(parsed.kv_cache_percent, None);
     }
 }

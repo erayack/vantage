@@ -4,8 +4,10 @@ Kernel-level per-tenant admission controller built with Rust and eBPF. Enforces 
 
 ## Use cases
 
-1. **CPU/network tenant admission**: enforce per-cgroup and optional L4/L7 packet admission policies at the kernel boundary, with durable userspace policy management and Prometheus counters.
-2. **LLM inference admission**: run the `examples/inference-admission` controller next to an inference stack to translate token-budget usage, KV-cache pressure, and GPU utilization into Vantage base policies and runtime overrides for inference endpoints.
+1. **vLLM inference admission**: run the `examples/inference-admission` controller next to vLLM, scrape `/metrics`, and translate KV-cache pressure, queued/running request counts, and token-budget proxy metrics into Vantage base policies and runtime overrides for inference endpoints. File-backed metrics remain available as a portable fallback for demos and tests.
+2. **CPU/network tenant admission**: enforce per-cgroup and optional L4/L7 packet admission policies at the kernel boundary, with durable userspace policy management and Prometheus counters.
+
+Vantage enforces network admission at the kernel boundary. Inference controllers are userspace adapters that translate model-serving pressure, such as vLLM metrics, file fixtures, and future NVML sources, into Vantage admission policy. Semantic scheduling inside vLLM, CUDA, or the inference runtime itself is out of scope.
 
 ## How it works
 
