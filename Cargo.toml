@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "examples/inference-admission",
     "vantage",
     "vantage-common",
     "vantage-ebpf",

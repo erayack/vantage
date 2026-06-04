@@ -2,11 +2,17 @@
 
 Kernel-level per-tenant admission controller built with Rust and eBPF. Enforces token-bucket rate limits at the `tc` hook, with a user-space control daemon for policy management and observability.
 
+## Use cases
+
+1. **CPU/network tenant admission**: enforce per-cgroup and optional L4/L7 packet admission policies at the kernel boundary, with durable userspace policy management and Prometheus counters.
+2. **LLM inference admission**: run the `examples/inference-admission` controller next to an inference stack to translate token-budget usage, KV-cache pressure, and GPU utilization into Vantage base policies and runtime overrides for inference endpoints.
+
 ## How it works
 
 - **eBPF data plane** (`vantage-ebpf`): a `tc` classifier that parses ingress packets, identifies tenants by `cgroup_id`, and applies flow-aware policy fallbacks using per-tenant token buckets. Fail-open on parse errors.
 - **Control daemon** (`vantage`): attaches the eBPF program, exposes an HTTP API to manage policies, and serves Prometheus metrics plus a benchmark snapshot endpoint.
 - **Shared contracts** (`vantage-common`): `#[repr(C)]` map types shared between kernel and user space to prevent layout drift.
+- **Inference example** (`examples/inference-admission`): a userspace controller that drives the existing HTTP API; it does not add inference-specific fields to the kernel ABI.
 
 ## Prerequisites
 
